@@ -80,10 +80,14 @@ pi selects: gpt-5.4       +  effort: medium  →  Cursor receives: gpt-5.4-mediu
 pi selects: composer-2     +  (no effort)     →  Cursor receives: composer-2
 ```
 
-Models **not deduped** (kept as-is with effort baked into the ID):
-- Single effort variant (e.g., `claude-4.6-sonnet-medium`, `claude-4.5-opus-high`)
-- No default/medium variant (e.g., `claude-4.6-opus-high` / `claude-4.6-opus-max`)
-- No effort at all (e.g., `composer-2`, `gemini-3.1-pro`, `kimi-k2.5`)
+When a group is **collapsed**, the proxy registers one model with `supportsReasoningEffort: true` and an internal effort map (see table above).
+
+**Collapsed** when Cursor returns either:
+
+- **Multiple** effort suffixes for the same `(base, -fast, -thinking)` group, or
+- **A single** variant whose parsed effort suffix is **non-empty** (for example only `claude-4.5-opus-high` is listed). The suffix is removed from the displayed ID so Pi's reasoning-effort setting supplies it.
+
+**Left as-is** (raw Cursor ID on that row, `supportsReasoningEffort: false`) when the group has **one** variant and the parsed effort suffix is **empty**—typically IDs with no effort segment, such as `composer-2`, `gemini-3.1-pro`, or `kimi-k2.5`.
 
 ### Disabling the mapping
 
