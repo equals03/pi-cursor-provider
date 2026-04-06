@@ -47,6 +47,7 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ShellStreamSchema,
   UserMessageActionSchema,
   UserMessageSchema,
   WriteRejectedSchema,
@@ -851,10 +852,20 @@ function handleExecMessage(
     }), sendFrame);
     return;
   }
-  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
+  if (execCase === "shellArgs") {
     const args = (execMsg as any).message.value;
     sendExecResult(execMsg, "shellResult", create(ShellResultSchema, {
       result: { case: "rejected", value: create(ShellRejectedSchema, {
+        command: args.command ?? "", workingDirectory: args.workingDirectory ?? "",
+        reason: REJECT_REASON, isReadonly: false,
+      }) },
+    }), sendFrame);
+    return;
+  }
+  if (execCase === "shellStreamArgs") {
+    const args = (execMsg as any).message.value;
+    sendExecResult(execMsg, "shellStream", create(ShellStreamSchema, {
+      event: { case: "rejected", value: create(ShellRejectedSchema, {
         command: args.command ?? "", workingDirectory: args.workingDirectory ?? "",
         reason: REJECT_REASON, isReadonly: false,
       }) },
@@ -899,6 +910,15 @@ function handleExecMessage(
   const resultCase = miscCaseMap[execCase as string];
   if (resultCase) {
     sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
+    return;
+  }
+
+  // Catch-all: log and attempt a generic rejection so the bridge doesn't hang
+  console.error(`[cursor-provider] UNHANDLED exec case: "${execCase}". Bridge may stall.`);
+  // Try to derive the result case name from the args case name
+  const guessedResult = (execCase as string)?.replace(/Args$/, "Result");
+  if (guessedResult && guessedResult !== execCase) {
+    sendExecResult(execMsg, guessedResult, create(McpResultSchema, {}), sendFrame);
   }
 }
 
