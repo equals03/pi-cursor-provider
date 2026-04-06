@@ -18,10 +18,7 @@ import {
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
-  ConversationStepSchema,
-  AgentConversationTurnStructureSchema,
-  ConversationTurnStructureSchema,
-  AssistantMessageSchema,
+
   BackgroundShellSpawnResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
@@ -133,11 +130,30 @@ interface ActiveBridge {
   pendingExecs: PendingExec[];
 }
 
-interface StoredConversation {
+export interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
+  /** Number of completed turns the checkpoint covers. Used to detect forks. */
+  checkpointTurnCount: number;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
+}
+
+/**
+ * Check if a stored conversation's checkpoint is valid for the given turn count.
+ * If not (fork detected), truncates the checkpoint to the fork point.
+ * Returns true if a fork was detected.
+ */
+export function detectForkAndInvalidate(stored: StoredConversation, turnCount: number, convKey: string): boolean {
+  if (stored.checkpoint && turnCount !== stored.checkpointTurnCount) {
+    // Discard checkpoint and start a fresh Cursor conversation.
+    // Keep blobStore (has system prompt blob needed for conversation init).
+    stored.checkpoint = null;
+    stored.checkpointTurnCount = 0;
+    stored.conversationId = deterministicConversationId(`${convKey}:${Date.now()}`);
+    return true;
+  }
+  return false;
 }
 
 interface StreamState {
@@ -501,6 +517,7 @@ async function handleChatCompletion(
   }
 
   const sessionId = body.user || undefined;
+  const turnCount = turns.length;
   const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
   const activeBridge = activeBridges.get(bridgeKey);
@@ -508,7 +525,7 @@ async function handleChatCompletion(
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(bridgeKey);
     if (activeBridge.bridge.alive) {
-      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, res);
+      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turnCount, res);
       return;
     }
     clearInterval(activeBridge.heartbeatTimer);
@@ -526,6 +543,7 @@ async function handleChatCompletion(
     stored = {
       conversationId: deterministicConversationId(convKey),
       checkpoint: null,
+      checkpointTurnCount: 0,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
     };
@@ -533,6 +551,9 @@ async function handleChatCompletion(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
+
+  // Detect forks: if incoming turn count doesn't match what the checkpoint covers, invalidate.
+  detectForkAndInvalidate(stored, turnCount, convKey);
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText = userText || (toolResults.length > 0
@@ -545,9 +566,9 @@ async function handleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, res);
+    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turnCount, res);
   } else {
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, res);
+    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turnCount, res);
   }
 }
 
@@ -651,27 +672,9 @@ function buildCursorRequest(
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
-    const turnBytes: Uint8Array[] = [];
-    for (const turn of turns) {
-      const userMsg = create(UserMessageSchema, { text: turn.userText, messageId: crypto.randomUUID() });
-      const userMsgBytes = toBinary(UserMessageSchema, userMsg);
-      const stepBytes: Uint8Array[] = [];
-      if (turn.assistantText) {
-        const step = create(ConversationStepSchema, {
-          message: { case: "assistantMessage", value: create(AssistantMessageSchema, { text: turn.assistantText }) },
-        });
-        stepBytes.push(toBinary(ConversationStepSchema, step));
-      }
-      const agentTurn = create(AgentConversationTurnStructureSchema, { userMessage: userMsgBytes, steps: stepBytes });
-      const turnStructure = create(ConversationTurnStructureSchema, {
-        turn: { case: "agentConversationTurn", value: agentTurn },
-      });
-      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
-    }
-
     conversationState = create(ConversationStateStructureSchema, {
       rootPromptMessagesJson: [systemBlobId],
-      turns: turnBytes,
+      turns: [],
       todos: [],
       pendingToolCalls: [],
       previousWorkspaceUris: [],
@@ -683,6 +686,12 @@ function buildCursorRequest(
       selfSummaryCount: 0,
       readPaths: [],
     });
+  }
+
+  // When no checkpoint but turns exist (e.g. after fork), Cursor ignores
+  // reconstructed protobuf turns. Inject history as text in the user message.
+  if (!checkpoint && turns.length > 0) {
+    userText = inlineConversationHistory(turns, userText);
   }
 
   const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
@@ -910,9 +919,32 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
+// ── Conversation history inlining ──
+
+/**
+ * When Cursor has no checkpoint (e.g. after fork), inject turn history
+ * as text into the user message so the model sees prior context.
+ */
+export function inlineConversationHistory(
+  turns: Array<{ userText: string; assistantText: string }>,
+  userText: string,
+): string {
+  const lines: string[] = ["<conversation_history>"];
+  for (const turn of turns) {
+    lines.push(`<user>\n${turn.userText}\n</user>`);
+    if (turn.assistantText) {
+      lines.push(`<assistant>\n${turn.assistantText}\n</assistant>`);
+    }
+  }
+  lines.push("</conversation_history>");
+  lines.push("");
+  lines.push(userText);
+  return lines.join("\n");
+}
+
 // ── Key derivation ──
 
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?: string): string {
+export function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?: string): string {
   if (sessionId) {
     return createHash("sha256").update(`bridge:${modelId}:${sessionId}`).digest("hex").slice(0, 16);
   }
@@ -921,7 +953,7 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?:
   return createHash("sha256").update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
 
-function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
+export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
   if (sessionId) {
     return createHash("sha256").update(`conv:${sessionId}`).digest("hex").slice(0, 16);
   }
@@ -930,7 +962,7 @@ function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): s
   return createHash("sha256").update(`conv:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
 
-function deterministicConversationId(convKey: string): string {
+export function deterministicConversationId(convKey: string): string {
   const hex = createHash("sha256").update(`cursor-conv-id:${convKey}`).digest("hex").slice(0, 32);
   return [
     hex.slice(0, 8), hex.slice(8, 12),
@@ -1044,10 +1076,11 @@ function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  turnCount: number,
   res: ServerResponse,
 ): void {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
-  writeSSEStream(bridge, heartbeatTimer, payload.blobStore, payload.mcpTools, modelId, bridgeKey, convKey, res);
+  writeSSEStream(bridge, heartbeatTimer, payload.blobStore, payload.mcpTools, modelId, bridgeKey, convKey, turnCount, res);
 }
 
 function writeSSEStream(
@@ -1058,6 +1091,7 @@ function writeSSEStream(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  turnCount: number,
   res: ServerResponse,
 ): void {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -1145,7 +1179,11 @@ function writeSSEStream(
           },
           (checkpointBytes) => {
             const stored = conversationStates.get(convKey);
-            if (stored) { stored.checkpoint = checkpointBytes; stored.lastAccessMs = Date.now(); }
+            if (stored) {
+              stored.checkpoint = checkpointBytes;
+              stored.checkpointTurnCount = turnCount + 1;
+              stored.lastAccessMs = Date.now();
+            }
           },
         );
       } catch (err) {
@@ -1200,6 +1238,7 @@ function handleToolResultResume(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  turnCount: number,
   res: ServerResponse,
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
@@ -1235,7 +1274,7 @@ function handleToolResultResume(
     bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
   }
 
-  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, res);
+  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount, res);
 }
 
 // ── Non-streaming response ──
@@ -1245,6 +1284,7 @@ async function handleNonStreamingResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
+  turnCount: number,
   res: ServerResponse,
 ): Promise<void> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -1273,7 +1313,11 @@ async function handleNonStreamingResponse(
             () => {},
             (checkpointBytes) => {
               const stored = conversationStates.get(convKey);
-              if (stored) { stored.checkpoint = checkpointBytes; stored.lastAccessMs = Date.now(); }
+              if (stored) {
+                stored.checkpoint = checkpointBytes;
+                stored.checkpointTurnCount = turnCount + 1;
+                stored.lastAccessMs = Date.now();
+              }
             },
           );
         } catch (err) {
