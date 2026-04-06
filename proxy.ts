@@ -108,6 +108,7 @@ interface ChatCompletionRequest {
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
   reasoning_effort?: string;
+  user?: string;
 }
 
 interface CursorRequestPayload {
@@ -499,8 +500,9 @@ async function handleChatCompletion(
     return;
   }
 
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const convKey = deriveConversationKey(body.messages);
+  const sessionId = body.user || undefined;
+  const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId);
+  const convKey = deriveConversationKey(body.messages, sessionId);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
@@ -910,13 +912,19 @@ function sendExecResult(
 
 // ── Key derivation ──
 
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
+function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?: string): string {
+  if (sessionId) {
+    return createHash("sha256").update(`bridge:${modelId}:${sessionId}`).digest("hex").slice(0, 16);
+  }
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256").update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
 
-function deriveConversationKey(messages: OpenAIMessage[]): string {
+function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
+  if (sessionId) {
+    return createHash("sha256").update(`conv:${sessionId}`).digest("hex").slice(0, 16);
+  }
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256").update(`conv:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
