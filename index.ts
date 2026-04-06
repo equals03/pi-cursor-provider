@@ -137,16 +137,33 @@ function modelConfig(m: CursorModel) {
 // ── Fallback models (shown before model discovery) ──
 
 const FALLBACK_MODELS: CursorModel[] = [
+  // Cursor
   { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-2-fast", name: "Composer 2 Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  // Anthropic
   { id: "claude-4.6-opus", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
   { id: "claude-4.6-sonnet", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-haiku", name: "Claude 4.5 Haiku", reasoning: true, contextWindow: 200_000, maxTokens: 8_192 },
+  // OpenAI
   { id: "gpt-5.4", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
-  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.4-mini", name: "GPT-5.4 Mini", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
   { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5", name: "GPT-5", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  { id: "gpt-5-mini", name: "GPT-5 Mini", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  // Google
   { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "gemini-3-pro", name: "Gemini 3 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "gemini-3-flash", name: "Gemini 3 Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  // xAI
+  { id: "grok-4.20", name: "Grok 4.20", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
+  // Moonshot
+  { id: "kimi-k2.5", name: "Kimi K2.5", reasoning: true, contextWindow: 128_000, maxTokens: 64_000 },
 ];
 
 // ── Extension ──

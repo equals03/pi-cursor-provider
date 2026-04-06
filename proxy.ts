@@ -340,12 +340,16 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
       if (decoded?.models?.length) {
         const models = normalizeCursorModels(decoded.models);
         if (models.length > 0) {
+          console.log(`[cursor-provider] Discovered ${models.length} models from Cursor API`);
           cachedModels = models;
           return models;
         }
       }
     }
-  } catch {}
+  } catch (err) {
+    console.error("[cursor-provider] Model discovery failed:", err instanceof Error ? err.message : err);
+  }
+  console.warn("[cursor-provider] Using fallback model list");
   cachedModels = FALLBACK_MODELS;
   return FALLBACK_MODELS;
 }
