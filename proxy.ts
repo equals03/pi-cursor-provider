@@ -19,6 +19,10 @@ import {
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
+  ConversationStepSchema,
+  AgentConversationTurnStructureSchema,
+  ConversationTurnStructureSchema,
+  AssistantMessageSchema,
 
   BackgroundShellSpawnResultSchema,
   DeleteResultSchema,
@@ -135,27 +139,10 @@ interface ActiveBridge {
 export interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
-  /** Number of completed turns the checkpoint covers. Used to detect forks. */
+  /** Number of completed turns the checkpoint covers. */
   checkpointTurnCount: number;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
-}
-
-/**
- * Check if a stored conversation's checkpoint is valid for the given turn count.
- * If not (fork detected), truncates the checkpoint to the fork point.
- * Returns true if a fork was detected.
- */
-export function detectForkAndInvalidate(stored: StoredConversation, turnCount: number, convKey: string): boolean {
-  if (stored.checkpoint && turnCount !== stored.checkpointTurnCount) {
-    // Discard checkpoint and start a fresh Cursor conversation.
-    // Keep blobStore (has system prompt blob needed for conversation init).
-    stored.checkpoint = null;
-    stored.checkpointTurnCount = 0;
-    stored.conversationId = deterministicConversationId(`${convKey}:${Date.now()}`);
-    return true;
-  }
-  return false;
 }
 
 interface StreamState {
@@ -555,8 +542,12 @@ async function handleChatCompletion(
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
-  // Detect forks: if incoming turn count doesn't match what the checkpoint covers, invalidate.
-  detectForkAndInvalidate(stored, turnCount, convKey);
+  // If incoming turn count doesn't match what the checkpoint covers (fork or divergence),
+  // discard the checkpoint. buildCursorRequest will reconstruct turns from the messages.
+  if (stored.checkpoint && turnCount !== stored.checkpointTurnCount) {
+    stored.checkpoint = null;
+    stored.checkpointTurnCount = 0;
+  }
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText = userText || (toolResults.length > 0
@@ -655,7 +646,7 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 
 // ── Build Cursor protobuf request ──
 
-function buildCursorRequest(
+export function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
   userText: string,
@@ -675,9 +666,39 @@ function buildCursorRequest(
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
+    // Reconstruct proper protobuf turns from the message history.
+    const turnBytes: Uint8Array[] = [];
+    for (const turn of turns) {
+      const userMsg = create(UserMessageSchema, {
+        text: turn.userText,
+        messageId: crypto.randomUUID(),
+      });
+      const userMsgBytes = toBinary(UserMessageSchema, userMsg);
+
+      const stepBytes: Uint8Array[] = [];
+      if (turn.assistantText) {
+        const step = create(ConversationStepSchema, {
+          message: {
+            case: "assistantMessage",
+            value: create(AssistantMessageSchema, { text: turn.assistantText }),
+          },
+        });
+        stepBytes.push(toBinary(ConversationStepSchema, step));
+      }
+
+      const agentTurn = create(AgentConversationTurnStructureSchema, {
+        userMessage: userMsgBytes,
+        steps: stepBytes,
+      });
+      const turnStructure = create(ConversationTurnStructureSchema, {
+        turn: { case: "agentConversationTurn", value: agentTurn },
+      });
+      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+    }
+
     conversationState = create(ConversationStateStructureSchema, {
       rootPromptMessagesJson: [systemBlobId],
-      turns: [],
+      turns: turnBytes,
       todos: [],
       pendingToolCalls: [],
       previousWorkspaceUris: [],
@@ -689,12 +710,6 @@ function buildCursorRequest(
       selfSummaryCount: 0,
       readPaths: [],
     });
-  }
-
-  // When no checkpoint but turns exist (e.g. after fork), Cursor ignores
-  // reconstructed protobuf turns. Inject history as text in the user message.
-  if (!checkpoint && turns.length > 0) {
-    userText = inlineConversationHistory(turns, userText);
   }
 
   const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
@@ -939,29 +954,6 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
-}
-
-// ── Conversation history inlining ──
-
-/**
- * When Cursor has no checkpoint (e.g. after fork), inject turn history
- * as text into the user message so the model sees prior context.
- */
-export function inlineConversationHistory(
-  turns: Array<{ userText: string; assistantText: string }>,
-  userText: string,
-): string {
-  const lines: string[] = ["<conversation_history>"];
-  for (const turn of turns) {
-    lines.push(`<user>\n${turn.userText}\n</user>`);
-    if (turn.assistantText) {
-      lines.push(`<assistant>\n${turn.assistantText}\n</assistant>`);
-    }
-  }
-  lines.push("</conversation_history>");
-  lines.push("");
-  lines.push(userText);
-  return lines.join("\n");
 }
 
 // ── Key derivation ──

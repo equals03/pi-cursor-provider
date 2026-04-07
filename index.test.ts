@@ -1,8 +1,19 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
 import { describe, expect, test } from "bun:test";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, supportsReasoningModelId } from "./index.ts";
-import { resolveModelId, deriveBridgeKey, deriveConversationKey, deterministicConversationId, detectForkAndInvalidate, inlineConversationHistory } from "./proxy.ts";
+import { resolveModelId, deriveBridgeKey, deriveConversationKey, deterministicConversationId, buildCursorRequest } from "./proxy.ts";
 import type { CursorModel, StoredConversation } from "./proxy.ts";
+import { fromBinary, toBinary } from "@bufbuild/protobuf";
+import {
+  AgentClientMessageSchema,
+  AgentRunRequestSchema,
+  ConversationStateStructureSchema,
+  ConversationTurnStructureSchema,
+  AgentConversationTurnStructureSchema,
+  ConversationStepSchema,
+  UserMessageSchema,
+  AssistantMessageSchema,
+} from "./proto/agent_pb.ts";
 
 // ── Helper ──
 
@@ -418,231 +429,140 @@ describe("deriveConversationKey", () => {
   });
 });
 
-// ── Fork detection ──
+// ── Turn reconstruction ──
 
-function makeStored(overrides: Partial<StoredConversation> = {}): StoredConversation {
-  return {
-    conversationId: "conv-original",
-    checkpoint: new Uint8Array([1, 2, 3]),
-    checkpointTurnCount: 1,
-    blobStore: new Map([["key", new Uint8Array([4, 5])]]),
-    lastAccessMs: Date.now(),
-    ...overrides,
-  };
+function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>) {
+  const clientMsg = fromBinary(AgentClientMessageSchema, payload.requestBytes);
+  expect(clientMsg.message.case).toBe("runRequest");
+  return clientMsg.message.value as InstanceType<typeof AgentRunRequestSchema["$typeName"]> & any;
 }
 
-describe("detectForkAndInvalidate", () => {
-  test("no fork — turn count matches checkpoint", () => {
-    const stored = makeStored({ checkpointTurnCount: 2 });
-    const originalId = stored.conversationId;
-    const result = detectForkAndInvalidate(stored, 2, "conv-key");
-    expect(result).toBe(false);
-    expect(stored.checkpoint).not.toBeNull();
-    expect(stored.conversationId).toBe(originalId);
-    expect(stored.blobStore.size).toBe(1);
+function decodeTurns(state: any) {
+  return (state.turns as Uint8Array[]).map((turnBytes: Uint8Array) => {
+    const turnStruct = fromBinary(ConversationTurnStructureSchema, turnBytes);
+    expect(turnStruct.turn.case).toBe("agentConversationTurn");
+    const agentTurn = turnStruct.turn.value as any;
+    const userMsg = fromBinary(UserMessageSchema, agentTurn.userMessage);
+    const steps = (agentTurn.steps as Uint8Array[]).map((s: Uint8Array) => fromBinary(ConversationStepSchema, s));
+    return { userMsg, steps };
+  });
+}
+
+describe("buildCursorRequest — turn reconstruction", () => {
+  test("no checkpoint, no turns — empty turns array", () => {
+    const payload = buildCursorRequest("gpt-5", "system", "hello", [], "conv-1", null);
+    const req = decodeRunRequest(payload);
+    expect(req.conversationState.turns).toHaveLength(0);
+    // User message is the action
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toBe("hello");
   });
 
-  test("no checkpoint — nothing to invalidate", () => {
-    const stored = makeStored({ checkpoint: null, checkpointTurnCount: 5 });
-    const originalId = stored.conversationId;
-    const result = detectForkAndInvalidate(stored, 0, "conv-key");
-    expect(result).toBe(false);
-    expect(stored.conversationId).toBe(originalId);
-  });
-
-  test("fork detected — checkpoint discarded, new conversation ID", () => {
-    const stored = makeStored({ checkpointTurnCount: 3 });
-    const originalId = stored.conversationId;
-    const result = detectForkAndInvalidate(stored, 1, "conv-key");
-    expect(result).toBe(true);
-    expect(stored.checkpoint).toBeNull();
-    expect(stored.checkpointTurnCount).toBe(0);
-    expect(stored.conversationId).not.toBe(originalId);
-    // Blob store preserved (has system prompt blob)
-    expect(stored.blobStore.size).toBe(1);
-  });
-
-  test("fork to beginning — checkpoint discarded", () => {
-    const stored = makeStored({ checkpointTurnCount: 3 });
-    const originalId = stored.conversationId;
-    const result = detectForkAndInvalidate(stored, 0, "conv-key");
-    expect(result).toBe(true);
-    expect(stored.checkpoint).toBeNull();
-    expect(stored.checkpointTurnCount).toBe(0);
-    expect(stored.conversationId).not.toBe(originalId);
-  });
-
-  test("fork detected — more turns than checkpoint", () => {
-    const stored = makeStored({ checkpointTurnCount: 1 });
-    const result = detectForkAndInvalidate(stored, 5, "conv-key");
-    expect(result).toBe(true);
-    expect(stored.checkpoint).toBeNull();
-    expect(stored.checkpointTurnCount).toBe(0);
-    // Blob store preserved
-    expect(stored.blobStore.size).toBe(1);
-  });
-
-  test("fork preserves blob store", () => {
-    const stored = makeStored({ checkpointTurnCount: 3 });
-    stored.blobStore.set("system-prompt", new Uint8Array([1, 2, 3]));
-    detectForkAndInvalidate(stored, 1, "conv-key");
-    expect(stored.blobStore.has("key")).toBe(true);
-    expect(stored.blobStore.has("system-prompt")).toBe(true);
-  });
-});
-
-describe("session + fork integration", () => {
-  test("normal conversation flow — checkpoint reused across turns", () => {
-    const convKey = deriveConversationKey([], "session-A");
-    const stored = makeStored({ checkpoint: null, checkpointTurnCount: 0, blobStore: new Map() });
-
-    // No checkpoint → no fork detection
-    expect(detectForkAndInvalidate(stored, 0, convKey)).toBe(false);
-
-    // Simulate checkpoint saved after request 1
-    stored.checkpoint = new Uint8Array([10]);
-    stored.checkpointTurnCount = 1;
-
-    // Request 2: turns.length=1 matches checkpointTurnCount=1
-    expect(detectForkAndInvalidate(stored, 1, convKey)).toBe(false);
-    expect(stored.checkpoint).not.toBeNull();
-
-    // Checkpoint saved after request 2
-    stored.checkpoint = new Uint8Array([20]);
-    stored.checkpointTurnCount = 2;
-
-    // Request 3: turns.length=2 matches checkpointTurnCount=2
-    expect(detectForkAndInvalidate(stored, 2, convKey)).toBe(false);
-    expect(stored.checkpoint).not.toBeNull();
-  });
-
-  test("fork after turn 1 — checkpoint discarded, conversation rebuilt from turns", () => {
-    const convKey = deriveConversationKey([], "session-B");
-    const stored = makeStored({ checkpointTurnCount: 2 });
-    const originalId = stored.conversationId;
-
-    // Fork: turns.length=1, checkpointTurnCount=2
-    expect(detectForkAndInvalidate(stored, 1, convKey)).toBe(true);
-    expect(stored.checkpoint).toBeNull();
-    expect(stored.checkpointTurnCount).toBe(0);
-    expect(stored.conversationId).not.toBe(originalId);
-    // Blob store preserved for conversation init
-    expect(stored.blobStore.size).toBe(1);
-  });
-
-  test("fork to beginning — checkpoint discarded", () => {
-    const convKey = deriveConversationKey([], "session-C");
-    const stored = makeStored({ checkpointTurnCount: 3 });
-    const originalId = stored.conversationId;
-
-    expect(detectForkAndInvalidate(stored, 0, convKey)).toBe(true);
-    expect(stored.checkpoint).toBeNull();
-    expect(stored.conversationId).not.toBe(originalId);
-  });
-
-  test("same session ID used for convKey across fork", () => {
-    const keyBefore = deriveConversationKey([msg("user", "test"), msg("assistant", "ok"), msg("user", "test 2")], "session-D");
-    const keyAfter = deriveConversationKey([msg("user", "test"), msg("assistant", "ok"), msg("user", "test 22")], "session-D");
-    expect(keyBefore).toBe(keyAfter);
-  });
-});
-
-// ── Conversation history inlining ──
-
-describe("inlineConversationHistory", () => {
-  test("prepends turns as XML to user message", () => {
+  test("no checkpoint, with turns — reconstructs protobuf turns", () => {
     const turns = [
-      { userText: 'respond "543"', assistantText: "543" },
+      { userText: "first question", assistantText: "first answer" },
+      { userText: "second question", assistantText: "second answer" },
     ];
-    const result = inlineConversationHistory(turns, "whats my last user message?");
-    expect(result).toContain("<conversation_history>");
-    expect(result).toContain('respond "543"');
-    expect(result).toContain("543");
-    expect(result).toContain("</conversation_history>");
-    expect(result).toEndWith("whats my last user message?");
+    const payload = buildCursorRequest("gpt-5", "system", "third question", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+
+    // 2 reconstructed turns
+    const decoded = decodeTurns(req.conversationState);
+    expect(decoded).toHaveLength(2);
+
+    expect(decoded[0].userMsg.text).toBe("first question");
+    expect(decoded[0].steps).toHaveLength(1);
+    expect(decoded[0].steps[0].message.case).toBe("assistantMessage");
+    expect((decoded[0].steps[0].message.value as any).text).toBe("first answer");
+
+    expect(decoded[1].userMsg.text).toBe("second question");
+    expect(decoded[1].steps[0].message.case).toBe("assistantMessage");
+    expect((decoded[1].steps[0].message.value as any).text).toBe("second answer");
+
+    // Current message is the action, NOT inlined into turns
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toBe("third question");
   });
 
-  test("multiple turns in order", () => {
+  test("no checkpoint, turn with empty assistant — no steps", () => {
+    const turns = [{ userText: "hello", assistantText: "" }];
+    const payload = buildCursorRequest("gpt-5", "system", "follow up", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+    const decoded = decodeTurns(req.conversationState);
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0].userMsg.text).toBe("hello");
+    expect(decoded[0].steps).toHaveLength(0);
+  });
+
+  test("with checkpoint — uses checkpoint, ignores turns", () => {
+    // Build a checkpoint from a known conversation
+    const priorPayload = buildCursorRequest("gpt-5", "system", "hello", [], "conv-1", null);
+    const priorReq = decodeRunRequest(priorPayload);
+    const checkpoint = toBinary(ConversationStateStructureSchema, priorReq.conversationState);
+
+    // Now pass turns that differ — checkpoint should win
+    const turns = [{ userText: "SHOULD NOT APPEAR", assistantText: "SHOULD NOT APPEAR" }];
+    const payload = buildCursorRequest("gpt-5", "system", "next", turns, "conv-1", checkpoint);
+    const req = decodeRunRequest(payload);
+
+    // Should have the checkpoint's turns (0), not the passed-in turns (1)
+    expect(req.conversationState.turns).toHaveLength(0);
+  });
+
+  test("system prompt stored in blobStore", () => {
+    const payload = buildCursorRequest("gpt-5", "You are helpful", "hi", [], "conv-1", null);
+    // rootPromptMessagesJson should have one blob ID
+    const req = decodeRunRequest(payload);
+    expect(req.conversationState.rootPromptMessagesJson).toHaveLength(1);
+    // The blob should be in the blobStore
+    const blobId = Buffer.from(req.conversationState.rootPromptMessagesJson[0]).toString("hex");
+    expect(payload.blobStore.has(blobId)).toBe(true);
+    const blobData = JSON.parse(new TextDecoder().decode(payload.blobStore.get(blobId)!));
+    expect(blobData.role).toBe("system");
+    expect(blobData.content).toBe("You are helpful");
+  });
+
+  test("each reconstructed turn has a unique messageId", () => {
     const turns = [
-      { userText: "first", assistantText: "resp1" },
-      { userText: "second", assistantText: "resp2" },
+      { userText: "a", assistantText: "b" },
+      { userText: "a", assistantText: "b" },
     ];
-    const result = inlineConversationHistory(turns, "current");
-    const firstIdx = result.indexOf("first");
-    const secondIdx = result.indexOf("second");
-    const currentIdx = result.indexOf("current");
-    expect(firstIdx).toBeLessThan(secondIdx);
-    expect(secondIdx).toBeLessThan(currentIdx);
-  });
-
-  test("no turns returns userText unchanged", () => {
-    // This path shouldn't be called with empty turns, but verify it's safe
-    const result = inlineConversationHistory([], "hello");
-    expect(result).toContain("hello");
+    const payload = buildCursorRequest("gpt-5", "system", "c", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+    const decoded = decodeTurns(req.conversationState);
+    expect(decoded[0].userMsg.messageId).not.toBe(decoded[1].userMsg.messageId);
   });
 });
 
-// ── Fork → inline history integration ──
+// ── Fork via checkpoint discard + reconstruction ──
 
-describe("fork inlines history into user message", () => {
-  test("fork discards checkpoint, then history is inlined", () => {
+describe("fork discards checkpoint, reconstruction takes over", () => {
+  test("fork scenario — checkpoint discarded, turns reconstructed from messages", () => {
     // Simulate: 2-turn conversation, fork back to 1 turn
-    const convKey = deriveConversationKey([], "session-F");
-    const stored = makeStored({ checkpointTurnCount: 2 });
+    // After fork, checkpoint is null → buildCursorRequest reconstructs from turns
+    const turns = [{ userText: "first", assistantText: "response1" }];
+    const payload = buildCursorRequest("gpt-5", "system", "forked question", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
 
-    // Fork detected: incoming turns=1, checkpoint covers 2
-    const forked = detectForkAndInvalidate(stored, 1, convKey);
-    expect(forked).toBe(true);
-    expect(stored.checkpoint).toBeNull();
+    const decoded = decodeTurns(req.conversationState);
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0].userMsg.text).toBe("first");
+    expect((decoded[0].steps[0].message.value as any).text).toBe("response1");
 
-    // Now simulate what buildCursorRequest does:
-    // if (!checkpoint && turns.length > 0) → inline history
-    const turns = [{ userText: 'respond "543"', assistantText: "543" }];
-    const userText = "whats my last user message?";
-    const checkpoint = stored.checkpoint; // null after fork
-
-    let effectiveUserText = userText;
-    if (!checkpoint && turns.length > 0) {
-      effectiveUserText = inlineConversationHistory(turns, userText);
-    }
-
-    expect(effectiveUserText).toContain("<conversation_history>");
-    expect(effectiveUserText).toContain('respond "543"');
-    expect(effectiveUserText).toContain("543");
-    expect(effectiveUserText).toEndWith("whats my last user message?");
+    // Current message is NOT inlined into turns
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toBe("forked question");
+    // No XML conversation_history tags anywhere
+    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
   });
 
-  test("no fork — checkpoint exists, history NOT inlined", () => {
-    const convKey = deriveConversationKey([], "session-G");
-    const stored = makeStored({ checkpointTurnCount: 1 });
-
-    // No fork: incoming turns=1 matches checkpoint
-    const forked = detectForkAndInvalidate(stored, 1, convKey);
-    expect(forked).toBe(false);
-
-    const turns = [{ userText: 'respond "543"', assistantText: "543" }];
-    const userText = "whats my last user message?";
-    const checkpoint = stored.checkpoint; // still set
-
-    let effectiveUserText = userText;
-    if (!checkpoint && turns.length > 0) {
-      effectiveUserText = inlineConversationHistory(turns, userText);
-    }
-
-    // User text unchanged — history is in the checkpoint, not inlined
-    expect(effectiveUserText).toBe(userText);
-  });
-
-  test("first message (no checkpoint, no turns) — not inlined", () => {
-    const userText = "hello";
-    const checkpoint = null;
-    const turns: Array<{ userText: string; assistantText: string }> = [];
-
-    let effectiveUserText = userText;
-    if (!checkpoint && turns.length > 0) {
-      effectiveUserText = inlineConversationHistory(turns, userText);
-    }
-
-    expect(effectiveUserText).toBe("hello");
+  test("fork to beginning — no turns, no reconstruction", () => {
+    const payload = buildCursorRequest("gpt-5", "system", "start over", [], "conv-1", null);
+    const req = decodeRunRequest(payload);
+    expect(req.conversationState.turns).toHaveLength(0);
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toBe("start over");
   });
 });
+
+

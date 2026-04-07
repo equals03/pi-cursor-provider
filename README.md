@@ -108,11 +108,11 @@ The proxy maintains conversation state per pi session, enabling multi-turn conve
 
 ### Session fork
 
-When you navigate back in pi's session tree and branch from an earlier point, the proxy detects the fork (turn count mismatch vs checkpoint) and starts a fresh Cursor conversation. Since Cursor's internal turn structure can't be reliably truncated, the proxy inlines the conversation history as text in the user message so the model retains context from before the fork.
+When you navigate back in pi's session tree and branch from an earlier point, the proxy detects the fork (turn count mismatch vs checkpoint) and discards the checkpoint. It then reconstructs proper protobuf conversation turns from the message history pi sends, so the model sees the real conversation structure up to the fork point.
 
 ### Session resume
 
-Conversation state is stored in memory. If the proxy restarts (pi restart), checkpoints are lost. On the next request, pi sends the full conversation history, which the proxy inlines as text — same as the fork path. The model sees the context but Cursor treats it as a new conversation.
+Conversation state is stored in memory. If the proxy restarts (pi restart), checkpoints are lost. On the next request, pi sends the full conversation history, which the proxy reconstructs as proper protobuf turns — the model sees real conversation structure, not inlined text.
 
 ## Requirements
 
