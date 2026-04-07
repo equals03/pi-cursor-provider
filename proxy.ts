@@ -574,7 +574,7 @@ function textContent(content: OpenAIMessage["content"]): string {
   return content.filter((p) => p.type === "text" && p.text).map((p) => p.text!).join("\n");
 }
 
-function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
+export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const pairs: Array<{ userText: string; assistantText: string }> = [];
   const toolResults: ToolResultInfo[] = [];
@@ -1330,7 +1330,10 @@ function handleToolResultResume(
     bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
   }
 
-  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount, req, res);
+  // The tool result is part of the same turn as the initial request.
+  // parseMessages sees the assistant(tool_calls) as an extra pair, inflating turnCount by 1.
+  // Subtract 1 so the checkpoint's turnCount matches the next normal request's turnCount.
+  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount - 1, req, res);
 }
 
 // ── Non-streaming response ──

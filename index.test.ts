@@ -1,7 +1,7 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
 import { describe, expect, test } from "bun:test";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, supportsReasoningModelId } from "./index.ts";
-import { resolveModelId, deriveBridgeKey, deriveConversationKey, deterministicConversationId, buildCursorRequest } from "./proxy.ts";
+import { resolveModelId, deriveBridgeKey, deriveConversationKey, deterministicConversationId, buildCursorRequest, parseMessages } from "./proxy.ts";
 import type { CursorModel, StoredConversation } from "./proxy.ts";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
@@ -562,6 +562,120 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     expect(req.conversationState.turns).toHaveLength(0);
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toBe("start over");
+  });
+});
+
+// ── Tool call turnCount inflation ──
+
+describe("tool call checkpoint turnCount", () => {
+  /**
+   * Simulates a full turn with tool calls and verifies the checkpoint's
+   * turnCount stays consistent so the next normal request matches.
+   *
+   * Flow:
+   *   1. Initial request: [system, user1] → turnCount=0
+   *      → checkpoint stores checkpointTurnCount = 0+1 = 1
+   *   2. Tool result request: [system, user1, assistant(tool_calls), tool(result)]
+   *      → parseMessages sees {user1, ""} as a pair → turnCount=1
+   *      → handleToolResultResume passes turnCount-1=0 to writeSSEStream
+   *      → checkpoint stores 0+1 = 1 (unchanged)
+   *   3. Next request: [system, user1, assistant(final), user2]
+   *      → parseMessages sees {user1, final} as a pair → turnCount=1
+   *      → 1 == 1 → checkpoint reused ✓
+   *
+   * BUG (before fix): step 2 passed raw turnCount=1 → stored 1+1=2
+   *   → step 3: turnCount=1 ≠ 2 → false fork → checkpoint discarded every turn
+   */
+
+  test("parseMessages: tool result request inflates turnCount vs initial request", () => {
+    // Step 1: initial request
+    const initialMsgs = [
+      { role: "system" as const, content: "system" },
+      { role: "user" as const, content: "read file X" },
+    ];
+    const initial = parseMessages(initialMsgs);
+    expect(initial.turns).toHaveLength(0);
+    expect(initial.userText).toBe("read file X");
+    const initialTurnCount = initial.turns.length; // 0
+
+    // Step 2: tool result request — pi adds assistant(tool_calls) + tool(result)
+    const toolResultMsgs = [
+      { role: "system" as const, content: "system" },
+      { role: "user" as const, content: "read file X" },
+      { role: "assistant" as const, content: null, tool_calls: [{ id: "tc1", type: "function" as const, function: { name: "read", arguments: '{"path":"X"}' } }] },
+      { role: "tool" as const, content: "file contents here", tool_call_id: "tc1" },
+    ];
+    const toolResult = parseMessages(toolResultMsgs);
+    const toolResultTurnCount = toolResult.turns.length; // 1 — inflated!
+
+    // Prove the inflation: tool result request sees 1 more turn than initial
+    expect(toolResultTurnCount).toBe(initialTurnCount + 1);
+
+    // Step 3: next normal request — pi includes the final assistant response
+    const nextMsgs = [
+      { role: "system" as const, content: "system" },
+      { role: "user" as const, content: "read file X" },
+      { role: "assistant" as const, content: "Here is file X..." },
+      { role: "user" as const, content: "now do Y" },
+    ];
+    const next = parseMessages(nextMsgs);
+    const nextTurnCount = next.turns.length; // 1
+
+    // The next request's turnCount matches the initial's checkpointTurnCount (initial + 1)
+    expect(nextTurnCount).toBe(initialTurnCount + 1);
+
+    // BUG: if we stored checkpointTurnCount = toolResultTurnCount + 1 = 2,
+    // then nextTurnCount (1) ≠ 2 → false fork detection
+    const buggyCheckpointTurnCount = toolResultTurnCount + 1; // 2
+    expect(nextTurnCount).not.toBe(buggyCheckpointTurnCount); // MISMATCH — proves the bug
+
+    // FIX: subtract 1 in tool result path → checkpointTurnCount = (toolResultTurnCount - 1) + 1 = 1
+    const fixedCheckpointTurnCount = (toolResultTurnCount - 1) + 1; // 1
+    expect(nextTurnCount).toBe(fixedCheckpointTurnCount); // MATCH — proves the fix
+  });
+
+  test("multi-turn: tool call on 3rd turn doesn't break 4th turn", () => {
+    // After 2 completed turns, 3rd turn has tool calls
+    const initialMsgs = [
+      { role: "system" as const, content: "sys" },
+      { role: "user" as const, content: "u1" },
+      { role: "assistant" as const, content: "a1" },
+      { role: "user" as const, content: "u2" },
+      { role: "assistant" as const, content: "a2" },
+      { role: "user" as const, content: "u3" },
+    ];
+    const initial = parseMessages(initialMsgs);
+    expect(initial.turns.length).toBe(2); // turnCount=2
+
+    // Tool result request for turn 3
+    const toolResultMsgs = [
+      ...initialMsgs.slice(0, -1), // up to u2/a2
+      { role: "user" as const, content: "u3" },
+      { role: "assistant" as const, content: null, tool_calls: [{ id: "t1", type: "function" as const, function: { name: "bash", arguments: '{}' } }] },
+      { role: "tool" as const, content: "output", tool_call_id: "t1" },
+    ];
+    const toolResult = parseMessages(toolResultMsgs);
+    expect(toolResult.turns.length).toBe(3); // inflated
+
+    // 4th turn normal request
+    const nextMsgs = [
+      { role: "system" as const, content: "sys" },
+      { role: "user" as const, content: "u1" },
+      { role: "assistant" as const, content: "a1" },
+      { role: "user" as const, content: "u2" },
+      { role: "assistant" as const, content: "a2" },
+      { role: "user" as const, content: "u3" },
+      { role: "assistant" as const, content: "a3 with tool results" },
+      { role: "user" as const, content: "u4" },
+    ];
+    const next = parseMessages(nextMsgs);
+    expect(next.turns.length).toBe(3); // turnCount=3
+
+    // Bug: toolResult turnCount + 1 = 4, next turnCount = 3 → mismatch
+    expect(next.turns.length).not.toBe(toolResult.turns.length + 1);
+
+    // Fix: (toolResult turnCount - 1) + 1 = 3 → matches
+    expect(next.turns.length).toBe((toolResult.turns.length - 1) + 1);
   });
 });
 
