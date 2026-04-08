@@ -10,17 +10,15 @@ import {
   buildCursorRequest,
   parseMessages,
 } from "./proxy.ts";
-import type { CursorModel, StoredConversation } from "./proxy.ts";
+import type { CursorModel, ParsedTurn } from "./proxy.ts";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   ConversationStateStructureSchema,
   ConversationTurnStructureSchema,
-  AgentConversationTurnStructureSchema,
   ConversationStepSchema,
   UserMessageSchema,
-  AssistantMessageSchema,
 } from "./proto/agent_pb.ts";
 
 // ── Helper ──
@@ -472,25 +470,32 @@ function decodeTurns(state: any) {
   });
 }
 
+const assistantStep = (text: string) => ({ kind: "assistantText", text } as const);
+const toolStep = (
+  toolCallId: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  result?: { content: string; isError: boolean },
+) => ({ kind: "toolCall", toolCallId, toolName, arguments: args, ...(result ? { result } : {}) } as const);
+const turn = (userText: string, steps: ParsedTurn["steps"] = []): ParsedTurn => ({ userText, steps });
+
 describe("buildCursorRequest — turn reconstruction", () => {
   test("no checkpoint, no turns — empty turns array", () => {
     const payload = buildCursorRequest("gpt-5", "system", "hello", [], "conv-1", null);
     const req = decodeRunRequest(payload);
     expect(req.conversationState.turns).toHaveLength(0);
-    // User message is the action
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toBe("hello");
   });
 
-  test("no checkpoint, with turns — reconstructs protobuf turns", () => {
+  test("no checkpoint, with assistant-text turns — reconstructs protobuf turns without inline fallback", () => {
     const turns = [
-      { userText: "first question", assistantText: "first answer" },
-      { userText: "second question", assistantText: "second answer" },
+      turn("first question", [assistantStep("first answer")]),
+      turn("second question", [assistantStep("second answer")]),
     ];
     const payload = buildCursorRequest("gpt-5", "system", "third question", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
 
-    // 2 reconstructed turns
     const decoded = decodeTurns(req.conversationState);
     expect(decoded).toHaveLength(2);
 
@@ -503,16 +508,45 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(decoded[1].steps[0].message.case).toBe("assistantMessage");
     expect((decoded[1].steps[0].message.value as any).text).toBe("second answer");
 
-    // Current message includes inlined history as text fallback
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toContain("<conversation_history>");
-    expect(userAction.userMessage.text).toContain("first question");
-    expect(userAction.userMessage.text).toContain("first answer");
-    expect(userAction.userMessage.text).toEndWith("third question");
+    expect(userAction.userMessage.text).toBe("third question");
+    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
   });
 
-  test("no checkpoint, turn with empty assistant — no steps", () => {
-    const turns = [{ userText: "hello", assistantText: "" }];
+  test("no checkpoint, reconstructs tool-call steps and final assistant text", () => {
+    const turns = [
+      turn("inspect file", [
+        toolStep("tc1", "read", { path: "src/index.ts" }, { content: "file contents", isError: false }),
+        assistantStep("I found the issue."),
+      ]),
+    ];
+    const payload = buildCursorRequest("gpt-5", "system", "fix it", turns, "conv-1", null);
+    const req = decodeRunRequest(payload);
+    const decoded = decodeTurns(req.conversationState);
+
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0].userMsg.text).toBe("inspect file");
+    expect(decoded[0].steps).toHaveLength(2);
+
+    const toolCallStep = decoded[0].steps[0]!;
+    expect(toolCallStep.message.case).toBe("toolCall");
+    expect(toolCallStep.message.value.tool.case).toBe("mcpToolCall");
+    expect(toolCallStep.message.value.tool.value.args?.toolCallId).toBe("tc1");
+    expect(toolCallStep.message.value.tool.value.args?.toolName).toBe("read");
+    expect(toolCallStep.message.value.tool.value.result?.result.case).toBe("success");
+    expect(toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.case).toBe("text");
+    expect(toolCallStep.message.value.tool.value.result?.result.value.content[0]?.content.value.text).toBe("file contents");
+
+    const finalAssistantStep = decoded[0].steps[1]!;
+    expect(finalAssistantStep.message.case).toBe("assistantMessage");
+    expect((finalAssistantStep.message.value as any).text).toBe("I found the issue.");
+
+    const userAction = req.action.action.value as any;
+    expect(userAction.userMessage.text).toBe("fix it");
+  });
+
+  test("no checkpoint, turn with no steps — no reconstructed steps", () => {
+    const turns = [turn("hello")];
     const payload = buildCursorRequest("gpt-5", "system", "follow up", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
     const decoded = decodeTurns(req.conversationState);
@@ -522,26 +556,21 @@ describe("buildCursorRequest — turn reconstruction", () => {
   });
 
   test("with checkpoint — uses checkpoint, ignores turns", () => {
-    // Build a checkpoint from a known conversation
     const priorPayload = buildCursorRequest("gpt-5", "system", "hello", [], "conv-1", null);
     const priorReq = decodeRunRequest(priorPayload);
     const checkpoint = toBinary(ConversationStateStructureSchema, priorReq.conversationState);
 
-    // Now pass turns that differ — checkpoint should win
-    const turns = [{ userText: "SHOULD NOT APPEAR", assistantText: "SHOULD NOT APPEAR" }];
+    const turns = [turn("SHOULD NOT APPEAR", [assistantStep("SHOULD NOT APPEAR")])];
     const payload = buildCursorRequest("gpt-5", "system", "next", turns, "conv-1", checkpoint);
     const req = decodeRunRequest(payload);
 
-    // Should have the checkpoint's turns (0), not the passed-in turns (1)
     expect(req.conversationState.turns).toHaveLength(0);
   });
 
   test("system prompt stored in blobStore", () => {
     const payload = buildCursorRequest("gpt-5", "You are helpful", "hi", [], "conv-1", null);
-    // rootPromptMessagesJson should have one blob ID
     const req = decodeRunRequest(payload);
     expect(req.conversationState.rootPromptMessagesJson).toHaveLength(1);
-    // The blob should be in the blobStore
     const blobId = Buffer.from(req.conversationState.rootPromptMessagesJson[0]).toString("hex");
     expect(payload.blobStore.has(blobId)).toBe(true);
     const blobData = JSON.parse(new TextDecoder().decode(payload.blobStore.get(blobId)!));
@@ -551,8 +580,8 @@ describe("buildCursorRequest — turn reconstruction", () => {
 
   test("each reconstructed turn has a unique messageId", () => {
     const turns = [
-      { userText: "a", assistantText: "b" },
-      { userText: "a", assistantText: "b" },
+      turn("a", [assistantStep("b")]),
+      turn("a", [assistantStep("b")]),
     ];
     const payload = buildCursorRequest("gpt-5", "system", "c", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
@@ -565,9 +594,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
 
 describe("fork discards checkpoint, reconstruction takes over", () => {
   test("fork scenario — checkpoint discarded, turns reconstructed from messages", () => {
-    // Simulate: 2-turn conversation, fork back to 1 turn
-    // After fork, checkpoint is null → buildCursorRequest reconstructs from turns
-    const turns = [{ userText: "first", assistantText: "response1" }];
+    const turns = [turn("first", [assistantStep("response1")])];
     const payload = buildCursorRequest("gpt-5", "system", "forked question", turns, "conv-1", null);
     const req = decodeRunRequest(payload);
 
@@ -576,12 +603,9 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     expect(decoded[0].userMsg.text).toBe("first");
     expect((decoded[0].steps[0].message.value as any).text).toBe("response1");
 
-    // Current message includes inlined history as text fallback
     const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toContain("<conversation_history>");
-    expect(userAction.userMessage.text).toContain("first");
-    expect(userAction.userMessage.text).toContain("response1");
-    expect(userAction.userMessage.text).toEndWith("forked question");
+    expect(userAction.userMessage.text).toBe("forked question");
+    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
   });
 
   test("fork to beginning — no turns, no reconstruction", () => {
@@ -593,30 +617,33 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
   });
 });
 
-// ── Tool call turnCount inflation ──
+// ── Tool-aware parsing ──
 
-describe("tool call checkpoint turnCount", () => {
-  /**
-   * Simulates a full turn with tool calls and verifies the checkpoint's
-   * turnCount stays consistent so the next normal request matches.
-   *
-   * Flow:
-   *   1. Initial request: [system, user1] → turnCount=0
-   *      → checkpoint stores checkpointTurnCount = 0+1 = 1
-   *   2. Tool result request: [system, user1, assistant(tool_calls), tool(result)]
-   *      → parseMessages sees {user1, ""} as a pair → turnCount=1
-   *      → handleToolResultResume passes turnCount-1=0 to writeSSEStream
-   *      → checkpoint stores 0+1 = 1 (unchanged)
-   *   3. Next request: [system, user1, assistant(final), user2]
-   *      → parseMessages sees {user1, final} as a pair → turnCount=1
-   *      → 1 == 1 → checkpoint reused ✓
-   *
-   * BUG (before fix): step 2 passed raw turnCount=1 → stored 1+1=2
-   *   → step 3: turnCount=1 ≠ 2 → false fork → checkpoint discarded every turn
-   */
+describe("parseMessages — structured tool turns", () => {
+  test("preserves tool call, tool result, and final assistant text in a completed turn", () => {
+    const parsed = parseMessages([
+      { role: "system", content: "system" },
+      { role: "user", content: "read file X" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"X"}' } }],
+      },
+      { role: "tool", content: "file contents here", tool_call_id: "tc1" },
+      { role: "assistant", content: "Here is file X..." },
+      { role: "user", content: "now do Y" },
+    ]);
 
-  test("parseMessages: tool result request inflates turnCount vs initial request", () => {
-    // Step 1: initial request
+    expect(parsed.userText).toBe("now do Y");
+    expect(parsed.toolResults).toEqual([]);
+    expect(parsed.turns).toHaveLength(1);
+    expect(parsed.turns[0]).toEqual(turn("read file X", [
+      toolStep("tc1", "read", { path: "X" }, { content: "file contents here", isError: false }),
+      assistantStep("Here is file X..."),
+    ]));
+  });
+
+  test("tool result continuation does not inflate completed turn count", () => {
     const initialMsgs = [
       { role: "system" as const, content: "system" },
       { role: "user" as const, content: "read file X" },
@@ -624,9 +651,7 @@ describe("tool call checkpoint turnCount", () => {
     const initial = parseMessages(initialMsgs);
     expect(initial.turns).toHaveLength(0);
     expect(initial.userText).toBe("read file X");
-    const initialTurnCount = initial.turns.length; // 0
 
-    // Step 2: tool result request — pi adds assistant(tool_calls) + tool(result)
     const toolResultMsgs = [
       { role: "system" as const, content: "system" },
       { role: "user" as const, content: "read file X" },
@@ -634,12 +659,11 @@ describe("tool call checkpoint turnCount", () => {
       { role: "tool" as const, content: "file contents here", tool_call_id: "tc1" },
     ];
     const toolResult = parseMessages(toolResultMsgs);
-    const toolResultTurnCount = toolResult.turns.length; // 1 — inflated!
 
-    // Prove the inflation: tool result request sees 1 more turn than initial
-    expect(toolResultTurnCount).toBe(initialTurnCount + 1);
+    expect(toolResult.turns).toHaveLength(0);
+    expect(toolResult.userText).toBe("read file X");
+    expect(toolResult.toolResults).toEqual([{ toolCallId: "tc1", content: "file contents here" }]);
 
-    // Step 3: next normal request — pi includes the final assistant response
     const nextMsgs = [
       { role: "system" as const, content: "system" },
       { role: "user" as const, content: "read file X" },
@@ -647,23 +671,10 @@ describe("tool call checkpoint turnCount", () => {
       { role: "user" as const, content: "now do Y" },
     ];
     const next = parseMessages(nextMsgs);
-    const nextTurnCount = next.turns.length; // 1
-
-    // The next request's turnCount matches the initial's checkpointTurnCount (initial + 1)
-    expect(nextTurnCount).toBe(initialTurnCount + 1);
-
-    // BUG: if we stored checkpointTurnCount = toolResultTurnCount + 1 = 2,
-    // then nextTurnCount (1) ≠ 2 → false fork detection
-    const buggyCheckpointTurnCount = toolResultTurnCount + 1; // 2
-    expect(nextTurnCount).not.toBe(buggyCheckpointTurnCount); // MISMATCH — proves the bug
-
-    // FIX: subtract 1 in tool result path → checkpointTurnCount = (toolResultTurnCount - 1) + 1 = 1
-    const fixedCheckpointTurnCount = (toolResultTurnCount - 1) + 1; // 1
-    expect(nextTurnCount).toBe(fixedCheckpointTurnCount); // MATCH — proves the fix
+    expect(next.turns.length).toBe(1);
   });
 
-  test("multi-turn: tool call on 3rd turn doesn't break 4th turn", () => {
-    // After 2 completed turns, 3rd turn has tool calls
+  test("multi-turn tool continuation keeps completed-history count stable", () => {
     const initialMsgs = [
       { role: "system" as const, content: "sys" },
       { role: "user" as const, content: "u1" },
@@ -673,19 +684,18 @@ describe("tool call checkpoint turnCount", () => {
       { role: "user" as const, content: "u3" },
     ];
     const initial = parseMessages(initialMsgs);
-    expect(initial.turns.length).toBe(2); // turnCount=2
+    expect(initial.turns.length).toBe(2);
 
-    // Tool result request for turn 3
     const toolResultMsgs = [
-      ...initialMsgs.slice(0, -1), // up to u2/a2
+      ...initialMsgs.slice(0, -1),
       { role: "user" as const, content: "u3" },
       { role: "assistant" as const, content: null, tool_calls: [{ id: "t1", type: "function" as const, function: { name: "bash", arguments: '{}' } }] },
       { role: "tool" as const, content: "output", tool_call_id: "t1" },
     ];
     const toolResult = parseMessages(toolResultMsgs);
-    expect(toolResult.turns.length).toBe(3); // inflated
+    expect(toolResult.turns.length).toBe(2);
+    expect(toolResult.toolResults).toEqual([{ toolCallId: "t1", content: "output" }]);
 
-    // 4th turn normal request
     const nextMsgs = [
       { role: "system" as const, content: "sys" },
       { role: "user" as const, content: "u1" },
@@ -697,13 +707,7 @@ describe("tool call checkpoint turnCount", () => {
       { role: "user" as const, content: "u4" },
     ];
     const next = parseMessages(nextMsgs);
-    expect(next.turns.length).toBe(3); // turnCount=3
-
-    // Bug: toolResult turnCount + 1 = 4, next turnCount = 3 → mismatch
-    expect(next.turns.length).not.toBe(toolResult.turns.length + 1);
-
-    // Fix: (toolResult turnCount - 1) + 1 = 3 → matches
-    expect(next.turns.length).toBe((toolResult.turns.length - 1) + 1);
+    expect(next.turns.length).toBe(3);
   });
 });
 

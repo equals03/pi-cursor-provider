@@ -37,10 +37,12 @@ import {
   KvClientMessageSchema,
   LsRejectedSchema,
   LsResultSchema,
+  McpArgsSchema,
   McpErrorSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
+  McpToolCallSchema,
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
@@ -53,6 +55,7 @@ import {
   ShellRejectedSchema,
   ShellResultSchema,
   ShellStreamSchema,
+  ToolCallSchema,
   UserMessageActionSchema,
   UserMessageSchema,
   WriteRejectedSchema,
@@ -158,10 +161,35 @@ interface ToolResultInfo {
   content: string;
 }
 
+export interface ParsedToolResult {
+  content: string;
+  isError: boolean;
+}
+
+export interface ParsedAssistantTextStep {
+  kind: "assistantText";
+  text: string;
+}
+
+export interface ParsedToolCallStep {
+  kind: "toolCall";
+  toolCallId: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+  result?: ParsedToolResult;
+}
+
+export type ParsedTurnStep = ParsedAssistantTextStep | ParsedToolCallStep;
+
+export interface ParsedTurn {
+  userText: string;
+  steps: ParsedTurnStep[];
+}
+
 interface ParsedMessages {
   systemPrompt: string;
   userText: string;
-  turns: Array<{ userText: string; assistantText: string }>;
+  turns: ParsedTurn[];
   toolResults: ToolResultInfo[];
 }
 
@@ -576,41 +604,125 @@ function textContent(content: OpenAIMessage["content"]): string {
   return content.filter((p) => p.type === "text" && p.text).map((p) => p.text!).join("\n");
 }
 
+function parseToolCallArguments(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return { value: parsed };
+  } catch {
+    return raw ? { __raw: raw } : {};
+  }
+}
+
+function isToolCallStep(step: ParsedTurnStep): step is ParsedToolCallStep {
+  return step.kind === "toolCall";
+}
+
+function stripTurnRuntimeState(turn: ParsedTurn & {
+  toolCallById?: Map<string, ParsedToolCallStep>;
+  sawToolResult?: boolean;
+  sawAssistantAfterToolResult?: boolean;
+}): ParsedTurn {
+  return { userText: turn.userText, steps: turn.steps };
+}
+
 export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
-  const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const toolResults: ToolResultInfo[] = [];
+  const turns: ParsedTurn[] = [];
 
   const systemParts = messages.filter((m) => m.role === "system").map((m) => textContent(m.content));
   if (systemParts.length > 0) systemPrompt = systemParts.join("\n");
 
   const nonSystem = messages.filter((m) => m.role !== "system");
-  let pendingUser = "";
+  let currentTurn: (ParsedTurn & {
+    toolCallById: Map<string, ParsedToolCallStep>;
+    sawToolResult: boolean;
+    sawAssistantAfterToolResult: boolean;
+  }) | null = null;
+
+  const finalizeCurrentTurn = () => {
+    if (!currentTurn) return;
+    turns.push(stripTurnRuntimeState(currentTurn));
+    currentTurn = null;
+  };
 
   for (const msg of nonSystem) {
-    if (msg.role === "tool") {
-      toolResults.push({ toolCallId: msg.tool_call_id ?? "", content: textContent(msg.content) });
-    } else if (msg.role === "user") {
-      if (pendingUser) pairs.push({ userText: pendingUser, assistantText: "" });
-      pendingUser = textContent(msg.content);
-    } else if (msg.role === "assistant") {
+    if (msg.role === "user") {
+      finalizeCurrentTurn();
+      currentTurn = {
+        userText: textContent(msg.content),
+        steps: [],
+        toolCallById: new Map(),
+        sawToolResult: false,
+        sawAssistantAfterToolResult: false,
+      };
+      continue;
+    }
+
+    if (!currentTurn) continue;
+
+    if (msg.role === "assistant") {
       const text = textContent(msg.content);
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: text });
-        pendingUser = "";
+      if (text) {
+        if (currentTurn.sawToolResult) currentTurn.sawAssistantAfterToolResult = true;
+        currentTurn.steps.push({ kind: "assistantText", text });
       }
+
+      for (const toolCall of msg.tool_calls ?? []) {
+        const step: ParsedToolCallStep = {
+          kind: "toolCall",
+          toolCallId: toolCall.id,
+          toolName: toolCall.function.name,
+          arguments: parseToolCallArguments(toolCall.function.arguments),
+        };
+        currentTurn.steps.push(step);
+        currentTurn.toolCallById.set(step.toolCallId, step);
+      }
+      continue;
+    }
+
+    if (msg.role === "tool") {
+      const toolCallId = msg.tool_call_id ?? "";
+      const content = textContent(msg.content);
+      const existing = toolCallId ? currentTurn.toolCallById.get(toolCallId) : undefined;
+      if (existing) {
+        existing.result = { content, isError: false };
+      } else {
+        const step: ParsedToolCallStep = {
+          kind: "toolCall",
+          toolCallId,
+          toolName: "",
+          arguments: {},
+          result: { content, isError: false },
+        };
+        currentTurn.steps.push(step);
+        if (toolCallId) currentTurn.toolCallById.set(toolCallId, step);
+      }
+      currentTurn.sawToolResult = true;
     }
   }
 
-  let lastUserText = "";
-  if (pendingUser) {
-    lastUserText = pendingUser;
-  } else if (pairs.length > 0 && toolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
+  let userText = "";
+  let toolResults: ToolResultInfo[] = [];
+
+  if (currentTurn) {
+    const isToolContinuation = currentTurn.sawToolResult && !currentTurn.sawAssistantAfterToolResult;
+    if (currentTurn.steps.length === 0 || isToolContinuation) {
+      userText = currentTurn.userText;
+      if (isToolContinuation) {
+        toolResults = currentTurn.steps
+          .filter(isToolCallStep)
+          .filter((step) => step.result)
+          .map((step) => ({ toolCallId: step.toolCallId, content: step.result!.content }));
+      }
+    } else {
+      turns.push(stripTurnRuntimeState(currentTurn));
+    }
   }
 
-  return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+  return { systemPrompt, userText, turns, toolResults };
 }
 
 // ── Tool definitions ──
@@ -648,11 +760,82 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 
 // ── Build Cursor protobuf request ──
 
+function encodeMcpArgValue(value: unknown): Uint8Array {
+  try {
+    return toBinary(ValueSchema, fromJson(ValueSchema, value as JsonValue));
+  } catch {
+    return new TextEncoder().encode(String(value));
+  }
+}
+
+function encodeMcpArgsMap(args: Record<string, unknown>): Record<string, Uint8Array> {
+  const encoded: Record<string, Uint8Array> = {};
+  for (const [key, value] of Object.entries(args)) encoded[key] = encodeMcpArgValue(value);
+  return encoded;
+}
+
+function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
+  if (step.kind === "assistantText") {
+    return toBinary(ConversationStepSchema, create(ConversationStepSchema, {
+      message: {
+        case: "assistantMessage",
+        value: create(AssistantMessageSchema, { text: step.text }),
+      },
+    }));
+  }
+
+  const toolName = step.toolName || "tool";
+  const mcpToolCall = create(McpToolCallSchema, {
+    args: create(McpArgsSchema, {
+      name: toolName,
+      args: encodeMcpArgsMap(step.arguments),
+      toolCallId: step.toolCallId,
+      providerIdentifier: "pi",
+      toolName,
+    }),
+    ...(step.result && {
+      result: create(McpResultSchema, {
+        result: step.result.isError
+          ? {
+              case: "error",
+              value: create(McpErrorSchema, { error: step.result.content }),
+            }
+          : {
+              case: "success",
+              value: create(McpSuccessSchema, {
+                content: [
+                  create(McpToolResultContentItemSchema, {
+                    content: {
+                      case: "text",
+                      value: create(McpTextContentSchema, { text: step.result.content }),
+                    },
+                  }),
+                ],
+                isError: false,
+              }),
+            },
+      }),
+    }),
+  });
+
+  return toBinary(ConversationStepSchema, create(ConversationStepSchema, {
+    message: {
+      case: "toolCall",
+      value: create(ToolCallSchema, {
+        tool: {
+          case: "mcpToolCall",
+          value: mcpToolCall,
+        },
+      }),
+    },
+  }));
+}
+
 export function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
   userText: string,
-  turns: Array<{ userText: string; assistantText: string }>,
+  turns: ParsedTurn[],
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
@@ -668,7 +851,6 @@ export function buildCursorRequest(
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
-    // Reconstruct proper protobuf turns from the message history.
     const turnBytes: Uint8Array[] = [];
     for (const turn of turns) {
       const userMsg = create(UserMessageSchema, {
@@ -676,17 +858,7 @@ export function buildCursorRequest(
         messageId: crypto.randomUUID(),
       });
       const userMsgBytes = toBinary(UserMessageSchema, userMsg);
-
-      const stepBytes: Uint8Array[] = [];
-      if (turn.assistantText) {
-        const step = create(ConversationStepSchema, {
-          message: {
-            case: "assistantMessage",
-            value: create(AssistantMessageSchema, { text: turn.assistantText }),
-          },
-        });
-        stepBytes.push(toBinary(ConversationStepSchema, step));
-      }
+      const stepBytes = turn.steps.map(buildTurnStepBytes);
 
       const agentTurn = create(AgentConversationTurnStructureSchema, {
         userMessage: userMsgBytes,
@@ -712,22 +884,6 @@ export function buildCursorRequest(
       selfSummaryCount: 0,
       readPaths: [],
     });
-  }
-
-  // Reconstructed protobuf turns are accepted by the server but not used for model context.
-  // Inline conversation history as text in the user message as the reliable fallback.
-  if (!checkpoint && turns.length > 0) {
-    const lines: string[] = ["<conversation_history>"];
-    for (const turn of turns) {
-      lines.push(`<user>\n${turn.userText}\n</user>`);
-      if (turn.assistantText) {
-        lines.push(`<assistant>\n${turn.assistantText}\n</assistant>`);
-      }
-    }
-    lines.push("</conversation_history>");
-    lines.push("");
-    lines.push(userText);
-    userText = lines.join("\n");
   }
 
   const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
@@ -1360,10 +1516,10 @@ function handleToolResultResume(
     bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
   }
 
-  // The tool result is part of the same turn as the initial request.
-  // parseMessages sees the assistant(tool_calls) as an extra pair, inflating turnCount by 1.
-  // Subtract 1 so the checkpoint's turnCount matches the next normal request's turnCount.
-  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount - 1, req, res);
+  // Tool results belong to the same user turn that initiated the tool calls.
+  // parseMessages now keeps tool continuations out of completed history, so turnCount
+  // already reflects the correct number of completed turns covered by the checkpoint.
+  writeSSEStream(bridge, heartbeatTimer, blobStore, mcpTools, modelId, bridgeKey, convKey, turnCount, req, res);
 }
 
 // ── Non-streaming response ──
