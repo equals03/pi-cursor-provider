@@ -149,6 +149,17 @@ npm install
 npm test
 ```
 
+## Debug log timeline
+
+When `PI_CURSOR_PROVIDER_DEBUG=1` is enabled, the proxy writes timestamped JSONL logs to `os.tmpdir()` by default. You can turn a log into a compact human-readable timeline with:
+
+```bash
+npm run debug:timeline -- --latest
+npm run debug:timeline -- /path/to/pi-cursor-provider-debug-2026-04-08T14-06-07-565Z-41184.log
+```
+
+Add `--json` if you want the parsed summary as JSON instead of formatted text.
+
 ## Credits
 
 OAuth flow and gRPC proxy adapted from [opencode-cursor](https://github.com/ephraimduncan/opencode-cursor) by Ephraim Duncan.
