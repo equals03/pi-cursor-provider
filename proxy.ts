@@ -201,6 +201,11 @@ const activeBridges = new Map<string, ActiveBridge>();
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 
+export const __testInternals = {
+  activeBridges,
+  conversationStates,
+};
+
 let proxyServer: ReturnType<typeof createServer> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
@@ -464,6 +469,13 @@ export async function startProxy(
   });
 }
 
+export function cleanupAllSessionState(): void {
+  for (const [bridgeKey, active] of activeBridges) {
+    cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+  }
+  conversationStates.clear();
+}
+
 export function stopProxy(): void {
   if (proxyServer) {
     proxyServer.close();
@@ -471,12 +483,7 @@ export function stopProxy(): void {
     proxyPort = undefined;
     proxyAccessTokenProvider = undefined;
   }
-  for (const active of activeBridges.values()) {
-    clearInterval(active.heartbeatTimer);
-    active.bridge.end();
-  }
-  activeBridges.clear();
-  conversationStates.clear();
+  cleanupAllSessionState();
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -1199,22 +1206,35 @@ export function derivePiSessionId(body: Pick<ChatCompletionRequest, "pi_session_
   return trimmed ? trimmed : undefined;
 }
 
+export function deriveBridgeKeyFromSessionId(sessionId: string): string {
+  return createHash("sha256").update(`bridge:${sessionId}`).digest("hex").slice(0, 16);
+}
+
+export function deriveConversationKeyFromSessionId(sessionId: string): string {
+  return createHash("sha256").update(`conv:${sessionId}`).digest("hex").slice(0, 16);
+}
+
 export function deriveBridgeKey(messages: OpenAIMessage[], sessionId?: string): string {
-  if (sessionId) {
-    return createHash("sha256").update(`bridge:${sessionId}`).digest("hex").slice(0, 16);
-  }
+  if (sessionId) return deriveBridgeKeyFromSessionId(sessionId);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256").update(`bridge:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
 
 export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
-  if (sessionId) {
-    return createHash("sha256").update(`conv:${sessionId}`).digest("hex").slice(0, 16);
-  }
+  if (sessionId) return deriveConversationKeyFromSessionId(sessionId);
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256").update(`conv:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+}
+
+export function cleanupSessionState(sessionId?: string): void {
+  if (!sessionId) return;
+  const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const active = activeBridges.get(bridgeKey);
+  if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+  conversationStates.delete(convKey);
 }
 
 export function deterministicConversationId(convKey: string): string {

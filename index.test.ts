@@ -1,10 +1,15 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
-import { describe, expect, test } from "bun:test";
-import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, supportsReasoningModelId } from "./index.ts";
+import { afterEach, describe, expect, test } from "bun:test";
+import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
   resolveModelId,
+  __testInternals,
+  cleanupAllSessionState,
+  cleanupSessionState,
   deriveBridgeKey,
+  deriveBridgeKeyFromSessionId,
   deriveConversationKey,
+  deriveConversationKeyFromSessionId,
   derivePiSessionId,
   deterministicConversationId,
   buildCompletedHistoryFingerprint,
@@ -22,6 +27,10 @@ import {
   ConversationStepSchema,
   UserMessageSchema,
 } from "./proto/agent_pb.ts";
+
+afterEach(() => {
+  cleanupAllSessionState();
+});
 
 // ── Helper ──
 
@@ -496,6 +505,130 @@ describe("checkpoint reuse guard", () => {
       checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(storedTurns),
     };
     expect(shouldDiscardStoredCheckpoint(stored, incomingTurns)).toBe(true);
+  });
+});
+
+describe("session cleanup", () => {
+  function seedSessionState(sessionId: string) {
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const writes: Uint8Array[] = [];
+    let ended = 0;
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: {
+        get alive() { return true; },
+        write(data: Uint8Array) { writes.push(data); },
+        end() { ended++; },
+        onData() {},
+        onClose() {},
+        proc: {} as any,
+      } as any,
+      heartbeatTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [],
+      currentTurn: turn("current"),
+    });
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+    return { bridgeKey, convKey, writes, get ended() { return ended; } };
+  }
+
+  test("cleanupSessionState removes active bridge and conversation for the session", () => {
+    const seeded = seedSessionState("session-a");
+    cleanupSessionState("session-a");
+    expect(__testInternals.activeBridges.has(seeded.bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(seeded.convKey)).toBe(false);
+    expect(seeded.writes.length).toBe(1);
+    expect(seeded.ended).toBe(1);
+  });
+
+  test("cleanupSessionState does not touch another session", () => {
+    const a = seedSessionState("session-a");
+    const b = seedSessionState("session-b");
+    cleanupSessionState("session-a");
+    expect(__testInternals.activeBridges.has(a.bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(a.convKey)).toBe(false);
+    expect(__testInternals.activeBridges.has(b.bridgeKey)).toBe(true);
+    expect(__testInternals.conversationStates.has(b.convKey)).toBe(true);
+  });
+});
+
+describe("session cleanup hook wiring", () => {
+  test("registerSessionLifecycleCleanup wires switch/fork/tree/shutdown to cleanup current session", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerSessionLifecycleCleanup(pi);
+
+    const sessionId = "session-hook";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: {
+        get alive() { return false; },
+        write() {},
+        end() {},
+        onData() {},
+        onClose() {},
+        proc: {} as any,
+      } as any,
+      heartbeatTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [],
+      currentTurn: turn("current"),
+    });
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId } };
+    for (const event of ["session_before_switch", "session_before_fork", "session_before_tree", "session_shutdown"]) {
+      __testInternals.activeBridges.set(bridgeKey, {
+        bridge: {
+          get alive() { return false; },
+          write() {},
+          end() {},
+          onData() {},
+          onClose() {},
+          proc: {} as any,
+        } as any,
+        heartbeatTimer,
+        blobStore: new Map(),
+        mcpTools: [],
+        pendingExecs: [],
+        currentTurn: turn("current"),
+      });
+      __testInternals.conversationStates.set(convKey, {
+        conversationId: "conv",
+        checkpoint: null,
+        checkpointTurnCount: 0,
+        checkpointHistoryFingerprint: null,
+        blobStore: new Map(),
+        lastAccessMs: Date.now(),
+      });
+      await handlers.get(event)?.({}, ctx);
+      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+      expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    }
   });
 });
 

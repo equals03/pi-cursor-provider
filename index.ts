@@ -21,7 +21,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.js";
-import { getCursorModels, startProxy, type CursorModel } from "./proxy.js";
+import { cleanupSessionState, getCursorModels, startProxy, type CursorModel } from "./proxy.js";
 
 // ── Cost estimation ──
 
@@ -245,6 +245,17 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
 
 // ── Extension ──
 
+export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
+  const cleanupCurrentSession = (_event: unknown, ctx: { sessionManager: { getSessionId(): string } }) => {
+    cleanupSessionState(ctx.sessionManager.getSessionId());
+  };
+
+  pi.on("session_before_switch", cleanupCurrentSession);
+  pi.on("session_before_fork", cleanupCurrentSession);
+  pi.on("session_before_tree", cleanupCurrentSession);
+  pi.on("session_shutdown", cleanupCurrentSession);
+}
+
 export default async function (pi: ExtensionAPI) {
   // Current access token, updated by login/refresh/getApiKey
   let currentToken = "";
@@ -257,6 +268,8 @@ export default async function (pi: ExtensionAPI) {
   });
 
   const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
+
+  registerSessionLifecycleCleanup(pi);
 
   pi.on("before_provider_request", (event, ctx) => {
     const payload = event.payload as Record<string, unknown> | undefined;
