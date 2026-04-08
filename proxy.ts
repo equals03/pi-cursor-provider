@@ -112,6 +112,7 @@ interface ChatCompletionRequest {
   tool_choice?: unknown;
   reasoning_effort?: string;
   user?: string;
+  pi_session_id?: string;
 }
 
 interface CursorRequestPayload {
@@ -506,9 +507,9 @@ async function handleChatCompletion(
     return;
   }
 
-  const sessionId = body.user || undefined;
+  const sessionId = derivePiSessionId(body);
   const turnCount = turns.length;
-  const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId);
+  const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
   const activeBridge = activeBridges.get(bridgeKey);
 
@@ -975,13 +976,20 @@ function sendExecResult(
 
 // ── Key derivation ──
 
-export function deriveBridgeKey(modelId: string, messages: OpenAIMessage[], sessionId?: string): string {
+export function derivePiSessionId(body: Pick<ChatCompletionRequest, "pi_session_id" | "user">): string | undefined {
+  const raw = body.pi_session_id ?? body.user;
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+export function deriveBridgeKey(messages: OpenAIMessage[], sessionId?: string): string {
   if (sessionId) {
-    return createHash("sha256").update(`bridge:${modelId}:${sessionId}`).digest("hex").slice(0, 16);
+    return createHash("sha256").update(`bridge:${sessionId}`).digest("hex").slice(0, 16);
   }
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256").update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
+  return createHash("sha256").update(`bridge:${firstUserText.slice(0, 200)}`).digest("hex").slice(0, 16);
 }
 
 export function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {

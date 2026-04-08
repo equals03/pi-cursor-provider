@@ -1,7 +1,15 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
 import { describe, expect, test } from "bun:test";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, supportsReasoningModelId } from "./index.ts";
-import { resolveModelId, deriveBridgeKey, deriveConversationKey, deterministicConversationId, buildCursorRequest, parseMessages } from "./proxy.ts";
+import {
+  resolveModelId,
+  deriveBridgeKey,
+  deriveConversationKey,
+  derivePiSessionId,
+  deterministicConversationId,
+  buildCursorRequest,
+  parseMessages,
+} from "./proxy.ts";
 import type { CursorModel, StoredConversation } from "./proxy.ts";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
@@ -376,35 +384,33 @@ const msg = (role: "user" | "assistant" | "system", content: string) => ({ role,
 describe("deriveBridgeKey", () => {
   test("uses sessionId when provided", () => {
     const msgs = [msg("user", "hello")];
-    const a = deriveBridgeKey("gpt-5", msgs, "session-abc");
-    const b = deriveBridgeKey("gpt-5", msgs, "session-abc");
+    const a = deriveBridgeKey(msgs, "session-abc");
+    const b = deriveBridgeKey(msgs, "session-abc");
     expect(a).toBe(b);
   });
 
   test("different sessionIds produce different keys", () => {
     const msgs = [msg("user", "hello")];
-    const a = deriveBridgeKey("gpt-5", msgs, "session-1");
-    const b = deriveBridgeKey("gpt-5", msgs, "session-2");
+    const a = deriveBridgeKey(msgs, "session-1");
+    const b = deriveBridgeKey(msgs, "session-2");
     expect(a).not.toBe(b);
   });
 
-  test("different models produce different keys", () => {
-    const msgs = [msg("user", "hello")];
-    const a = deriveBridgeKey("gpt-5", msgs, "session-1");
-    const b = deriveBridgeKey("claude-4", msgs, "session-1");
-    expect(a).not.toBe(b);
+  test("same sessionId ignores later messages", () => {
+    const a = deriveBridgeKey([msg("user", "hello")], "session-1");
+    const b = deriveBridgeKey([msg("user", "goodbye")], "session-1");
+    expect(a).toBe(b);
   });
 
   test("falls back to first user message hash without sessionId", () => {
     const msgs1 = [msg("user", "hello")];
     const msgs2 = [msg("user", "hello"), msg("assistant", "hi"), msg("user", "bye")];
-    // Same first user message → same key
-    expect(deriveBridgeKey("gpt-5", msgs1)).toBe(deriveBridgeKey("gpt-5", msgs2));
+    expect(deriveBridgeKey(msgs1)).toBe(deriveBridgeKey(msgs2));
   });
 
   test("fallback differs by first user message", () => {
-    const a = deriveBridgeKey("gpt-5", [msg("user", "hello")]);
-    const b = deriveBridgeKey("gpt-5", [msg("user", "goodbye")]);
+    const a = deriveBridgeKey([msg("user", "hello")]);
+    const b = deriveBridgeKey([msg("user", "goodbye")]);
     expect(a).not.toBe(b);
   });
 });
@@ -426,6 +432,24 @@ describe("deriveConversationKey", () => {
     const a = deriveConversationKey([msg("user", "hello")]);
     const b = deriveConversationKey([msg("user", "hello"), msg("assistant", "hi")]);
     expect(a).toBe(b);
+  });
+});
+
+describe("derivePiSessionId", () => {
+  test("prefers pi_session_id over user", () => {
+    expect(derivePiSessionId({ pi_session_id: "a", user: "b" })).toBe("a");
+  });
+
+  test("falls back to user", () => {
+    expect(derivePiSessionId({ user: "legacy" })).toBe("legacy");
+  });
+
+  test("trims whitespace", () => {
+    expect(derivePiSessionId({ pi_session_id: "  x  " })).toBe("x");
+  });
+
+  test("returns undefined when empty", () => {
+    expect(derivePiSessionId({ pi_session_id: "   ", user: "" })).toBeUndefined();
   });
 });
 

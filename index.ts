@@ -258,11 +258,10 @@ export default async function (pi: ExtensionAPI) {
 
   const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
 
-  // Inject session ID into request body so the proxy can use it for session keying.
   pi.on("before_provider_request", (event, ctx) => {
     const payload = event.payload as Record<string, unknown> | undefined;
     if (payload && ctx.model?.provider === "cursor") {
-      payload.user = ctx.sessionManager.getSessionId();
+      payload.pi_session_id = ctx.sessionManager.getSessionId();
     }
     return payload;
   });
