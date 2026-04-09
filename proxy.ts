@@ -157,9 +157,6 @@ interface ActiveBridge {
 export interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
-  /** Number of turns the checkpoint should match against on the next request. */
-  checkpointTurnCount: number;
-  checkpointHistoryFingerprint: string | null;
   sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
@@ -694,8 +691,7 @@ async function handleChatCompletion(
     stored = {
       conversationId: deterministicConversationId(convKey),
       checkpoint: null,
-      checkpointTurnCount: 0,
-      checkpointHistoryFingerprint: null,
+
       sessionScoped: !!sessionId,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
@@ -704,22 +700,6 @@ async function handleChatCompletion(
   }
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
-
-  // Discard checkpoints whenever the completed-history fingerprint no longer matches.
-  // This covers both turn-count mismatches and same-depth branch switches.
-  if (shouldDiscardStoredCheckpoint(stored, turns)) {
-    debugLog("chat.discard_checkpoint", {
-      requestId,
-      convKey,
-      checkpointTurnCount: stored.checkpointTurnCount,
-      checkpointHistoryFingerprint: stored.checkpointHistoryFingerprint,
-      incomingTurnCount: turns.length,
-      incomingHistoryFingerprint: buildCompletedHistoryFingerprint(turns),
-    });
-    stored.checkpoint = null;
-    stored.checkpointTurnCount = 0;
-    stored.checkpointHistoryFingerprint = null;
-  }
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText = userText || (toolResults.length > 0
@@ -793,53 +773,6 @@ function appendAssistantTextToTurn(turn: ParsedTurn, text: string): void {
   } else {
     turn.steps.push({ kind: "assistantText", text });
   }
-}
-
-function buildInterruptedRequestHistory(completedTurns: ParsedTurn[], currentTurn: ParsedTurn): ParsedTurn[] {
-  return [...completedTurns, { userText: currentTurn.userText, steps: [] }];
-}
-
-function canonicalizeFingerprintValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalizeFingerprintValue);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, inner]) => [key, canonicalizeFingerprintValue(inner)]),
-    );
-  }
-  return value;
-}
-
-export function buildCompletedHistoryFingerprint(turns: ParsedTurn[]): string {
-  const normalized = turns.map((turn) => ({
-    userText: turn.userText,
-    steps: turn.steps.map((step) => step.kind === "assistantText"
-      ? { kind: step.kind, text: step.text }
-      : {
-          kind: step.kind,
-          toolCallId: step.toolCallId,
-          toolName: step.toolName,
-          arguments: canonicalizeFingerprintValue(step.arguments),
-          result: step.result
-            ? {
-                content: step.result.content,
-                isError: step.result.isError,
-              }
-            : undefined,
-        }),
-  }));
-  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
-}
-
-export function shouldDiscardStoredCheckpoint(
-  stored: Pick<StoredConversation, "checkpoint" | "checkpointTurnCount" | "checkpointHistoryFingerprint">,
-  turns: ParsedTurn[],
-): boolean {
-  if (!stored.checkpoint) return false;
-  if (turns.length !== stored.checkpointTurnCount) return true;
-  const fingerprint = buildCompletedHistoryFingerprint(turns);
-  return stored.checkpointHistoryFingerprint !== fingerprint;
 }
 
 function stripTurnRuntimeState(turn: ParsedTurn & {
@@ -1766,9 +1699,7 @@ function writeSSEStream(
             if (stored) {
               stored.checkpoint = checkpointBytes;
               for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-              const interruptedHistory = buildInterruptedRequestHistory(completedTurns, currentTurn);
-              stored.checkpointTurnCount = interruptedHistory.length;
-              stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint(interruptedHistory);
+
               stored.lastAccessMs = Date.now();
             }
             debugLog("stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
@@ -1804,8 +1735,6 @@ function writeSSEStream(
       stored.lastAccessMs = Date.now();
       if (!cancelled && latestCheckpoint) {
         stored.checkpoint = latestCheckpoint;
-        stored.checkpointTurnCount = completedTurns.length + 1;
-        stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
         debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
       }
     }
@@ -2009,9 +1938,7 @@ async function handleNonStreamingResponse(
               if (stored) {
                 stored.checkpoint = checkpointBytes;
                 for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-                const interruptedHistory = buildInterruptedRequestHistory(completedTurns, currentTurn);
-                stored.checkpointTurnCount = interruptedHistory.length;
-                stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint(interruptedHistory);
+  
                 stored.lastAccessMs = Date.now();
               }
               debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
@@ -2042,8 +1969,6 @@ async function handleNonStreamingResponse(
         stored.lastAccessMs = Date.now();
         if (!cancelled && !nonStreamError && latestCheckpoint) {
           stored.checkpoint = latestCheckpoint;
-          stored.checkpointTurnCount = completedTurns.length + 1;
-          stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
           debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
         }
       }
