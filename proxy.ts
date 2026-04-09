@@ -705,6 +705,12 @@ async function handleChatCompletion(
   const effectiveUserText = userText || (toolResults.length > 0
     ? toolResults.map((r) => r.content).join("\n")
     : "");
+  // When no checkpoint exists, use a fresh conversationId so Cursor doesn't
+  // choke on stale server-side state from a previous interrupted connection.
+  // The full conversation history is still rebuilt from turns.
+  if (!stored.checkpoint) {
+    stored.conversationId = crypto.randomUUID();
+  }
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
