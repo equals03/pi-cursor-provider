@@ -940,6 +940,26 @@ function encodeMcpArgsMap(args: Record<string, unknown>): Record<string, Uint8Ar
   return encoded;
 }
 
+/** Build the selectedContextBlob payload — references rootPromptMessagesJson blobs + client name. */
+function buildSelectedContextBlob(rootPromptBlobIds: Uint8Array[], clientName: string): Uint8Array {
+  // No known schema for this message; encode raw protobuf wire format.
+  // field 1 (repeated bytes) = rootPromptMessagesJson blob refs
+  // field 22 (string) = client name
+  const parts: Uint8Array[] = [];
+  for (const blobId of rootPromptBlobIds) {
+    // tag = (1 << 3) | 2 = 0x0A, then varint length, then data
+    parts.push(new Uint8Array([0x0A, blobId.length, ...blobId]));
+  }
+  const clientBytes = new TextEncoder().encode(clientName);
+  // tag for field 22 = (22 << 3) | 2 = 178 = 0xB2, varint continuation: 0xB2 0x01
+  parts.push(new Uint8Array([0xB2, 0x01, clientBytes.length, ...clientBytes]));
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) { result.set(p, offset); offset += p.length; }
+  return result;
+}
+
 function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint8Array {
   const id = new Uint8Array(createHash("sha256").update(data).digest());
   blobStore.set(Buffer.from(id).toString("hex"), data);
@@ -1030,6 +1050,9 @@ export function buildCursorRequest(
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
+    const selectedCtxBlob = storeAsBlob(
+      buildSelectedContextBlob([systemBlobId], "pi"), blobStore,
+    );
     const turnBlobIds: Uint8Array[] = [];
     for (const turn of turns) {
       const msgId = crypto.randomUUID();
@@ -1038,6 +1061,7 @@ export function buildCursorRequest(
         messageId: msgId,
         selectedContext: create(SelectedContextSchema, {}),
         mode: 1,
+        selectedContextBlob: selectedCtxBlob,
         correlationId: msgId,
       });
       const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
@@ -1072,12 +1096,16 @@ export function buildCursorRequest(
     });
   }
 
+  const actionSelectedCtxBlob = storeAsBlob(
+    buildSelectedContextBlob([systemBlobId], "pi"), blobStore,
+  );
   const actionMsgId = crypto.randomUUID();
   const userMessage = create(UserMessageSchema, {
     text: userText,
     messageId: actionMsgId,
     selectedContext: create(SelectedContextSchema, {}),
     mode: 1,
+    selectedContextBlob: actionSelectedCtxBlob,
     correlationId: actionMsgId,
   });
   const action = create(ConversationActionSchema, {
