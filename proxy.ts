@@ -53,6 +53,7 @@ import {
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
+  SelectedContextSchema,
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
@@ -1031,9 +1032,13 @@ export function buildCursorRequest(
   } else {
     const turnBlobIds: Uint8Array[] = [];
     for (const turn of turns) {
+      const msgId = crypto.randomUUID();
       const userMsg = create(UserMessageSchema, {
         text: turn.userText,
-        messageId: crypto.randomUUID(),
+        messageId: msgId,
+        selectedContext: create(SelectedContextSchema, {}),
+        mode: 1,
+        correlationId: msgId,
       });
       const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
       const stepBlobIds = turn.steps.map(s => storeAsBlob(buildTurnStepBytes(s), blobStore));
@@ -1054,7 +1059,8 @@ export function buildCursorRequest(
       turns: turnBlobIds,
       todos: [],
       pendingToolCalls: [],
-      previousWorkspaceUris: [],
+      previousWorkspaceUris: [`file://${process.cwd()}`],
+      mode: 1,
       fileStates: {},
       fileStatesV2: {},
       summaryArchives: [],
@@ -1062,10 +1068,18 @@ export function buildCursorRequest(
       subagentStates: {},
       selfSummaryCount: 0,
       readPaths: [],
+      clientName: "pi",
     });
   }
 
-  const userMessage = create(UserMessageSchema, { text: userText, messageId: crypto.randomUUID() });
+  const actionMsgId = crypto.randomUUID();
+  const userMessage = create(UserMessageSchema, {
+    text: userText,
+    messageId: actionMsgId,
+    selectedContext: create(SelectedContextSchema, {}),
+    mode: 1,
+    correlationId: actionMsgId,
+  });
   const action = create(ConversationActionSchema, {
     action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) },
   });
