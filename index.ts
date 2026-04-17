@@ -364,7 +364,11 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
 // ── Extension ──
 
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
-  const cleanupCurrentSession = (_event: unknown, ctx: { sessionManager: { getSessionId(): string; getLeafId?: () => string } }) => {
+  const cleanupCurrentSession = (...args: unknown[]) => {
+    const ctx = args[1] as
+      | { sessionManager: { getSessionId(): string; getLeafId?: () => string } }
+      | undefined;
+    if (!ctx?.sessionManager) return;
     debugExtensionLog("session.cleanup_hook", {
       sessionId: ctx.sessionManager.getSessionId(),
       leafId: ctx.sessionManager.getLeafId?.(),
@@ -381,7 +385,7 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
 function registerExtensionDebugHooks(pi: ExtensionAPI) {
   if (!isExtensionDebugEnabled()) return;
 
-  pi.on("message_start", async (event, ctx) => {
+  pi.on("message_start", (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
     debugExtensionLog("message.start", {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -391,7 +395,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("message_update", async (event, ctx) => {
+  pi.on("message_update", (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
     const typedEvent = event as { message?: unknown; assistantMessageEvent?: Record<string, unknown> };
     debugExtensionLog("message.update", {
@@ -408,7 +412,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("message_end", async (event, ctx) => {
+  pi.on("message_end", (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
     debugExtensionLog("message.end", {
       sessionId: ctx.sessionManager.getSessionId(),
@@ -419,7 +423,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("context", async (event, ctx) => {
+  pi.on("context", (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
     const typedEvent = event as { messages?: unknown[] };
     debugExtensionLog("context", {
@@ -434,7 +438,7 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("turn_end", async (event, ctx) => {
+  pi.on("turn_end", (event, ctx) => {
     if (ctx.model?.provider !== "cursor") return;
     const typedEvent = event as { turnIndex?: number; message?: unknown; toolResults?: unknown[] };
     debugExtensionLog("turn.end", {
@@ -512,9 +516,8 @@ export default async function (pi: ExtensionAPI) {
           currentToken = accessToken;
 
           // Discover real models and re-register
-          const realPort = await proxyReady;
           const discovered = await getCursorModels(accessToken);
-          if (discovered.length > 0) register(pi, realPort, discovered);
+          if (discovered.length > 0) register(pi, port, discovered);
 
           return {
             refresh: refreshToken,
@@ -528,9 +531,8 @@ export default async function (pi: ExtensionAPI) {
           currentToken = refreshed.access;
 
           // Discover real models on refresh too
-          const realPort = await proxyReady;
           const discovered = await getCursorModels(refreshed.access);
-          if (discovered.length > 0) register(pi, realPort, discovered);
+          if (discovered.length > 0) register(pi, port, discovered);
 
           return refreshed;
         },
@@ -542,6 +544,5 @@ export default async function (pi: ExtensionAPI) {
       },
     });
   }
-
 
 }

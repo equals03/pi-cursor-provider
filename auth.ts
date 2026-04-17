@@ -19,6 +19,12 @@ const POLL_BASE_DELAY = 1000;
 const POLL_MAX_DELAY = 10_000;
 const POLL_BACKOFF_MULTIPLIER = 1.2;
 
+const CURSOR_AUTH_MISSING_TOKENS_MSG =
+  "Cursor auth response missing tokens";
+
+const CURSOR_REFRESH_MISSING_ACCESS_MSG =
+  "Cursor token refresh response missing access token";
+
 // ── PKCE ──
 
 async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
@@ -70,9 +76,10 @@ export async function pollCursorAuth(
     await new Promise((r) => setTimeout(r, delay));
 
     try {
-      const response = await fetch(
-        `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
-      );
+      const pollUrl = new URL(CURSOR_POLL_URL);
+      pollUrl.searchParams.set("uuid", uuid);
+      pollUrl.searchParams.set("verifier", verifier);
+      const response = await fetch(pollUrl.toString());
 
       if (response.status === 404) {
         consecutiveErrors = 0;
@@ -82,9 +89,17 @@ export async function pollCursorAuth(
 
       if (response.ok) {
         const data = (await response.json()) as {
-          accessToken: string;
-          refreshToken: string;
+          accessToken?: string;
+          refreshToken?: string;
         };
+        if (
+          typeof data.accessToken !== "string" ||
+          data.accessToken.length === 0 ||
+          typeof data.refreshToken !== "string" ||
+          data.refreshToken.length === 0
+        ) {
+          throw new Error(CURSOR_AUTH_MISSING_TOKENS_MSG);
+        }
         return {
           accessToken: data.accessToken,
           refreshToken: data.refreshToken,
@@ -93,6 +108,12 @@ export async function pollCursorAuth(
 
       throw new Error(`Poll failed: ${response.status}`);
     } catch (err) {
+      if (
+        err instanceof Error &&
+        err.message === CURSOR_AUTH_MISSING_TOKENS_MSG
+      ) {
+        throw err;
+      }
       consecutiveErrors++;
       if (consecutiveErrors >= 3) {
         throw new Error(
@@ -131,13 +152,20 @@ export async function refreshCursorToken(
   }
 
   const data = (await response.json()) as {
-    accessToken: string;
-    refreshToken: string;
+    accessToken?: string;
+    refreshToken?: string;
   };
+
+  if (typeof data.accessToken !== "string" || data.accessToken.length === 0) {
+    throw new Error(CURSOR_REFRESH_MISSING_ACCESS_MSG);
+  }
 
   return {
     access: data.accessToken,
-    refresh: data.refreshToken || refreshToken,
+    refresh:
+      typeof data.refreshToken === "string" && data.refreshToken.length > 0
+        ? data.refreshToken
+        : refreshToken,
     expires: getTokenExpiry(data.accessToken),
   };
 }
@@ -151,7 +179,7 @@ export function getTokenExpiry(token: string): number {
       return Date.now() + 3600 * 1000;
     }
     const decoded = JSON.parse(
-      atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")),
+      Buffer.from(parts[1], "base64url").toString("utf8"),
     );
     if (
       decoded &&
