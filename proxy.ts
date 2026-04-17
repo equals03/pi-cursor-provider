@@ -69,12 +69,17 @@ import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
   GitRepoInfoSchema,
+  PackageType,
   RequestContextEnvSchema,
+  SkillDescriptorSchema,
+  SkillOptionsSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
   type KvServerMessage,
   type McpToolDefinition,
+  type SkillDescriptor,
+  type SkillOptions,
   type UserMessage,
 } from "./proto/agent_pb.js";
 
@@ -97,7 +102,8 @@ interface ContentPart {
 }
 
 interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
+  /** Pi may send `developer` for system-level instructions (OpenAI-style); must be merged into the system prompt. */
+  role: "system" | "developer" | "user" | "assistant" | "tool";
   content: string | null | ContentPart[];
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
@@ -710,6 +716,7 @@ async function handleChatCompletion(
   }
 
   const workspaceRoot = resolveWorkspaceRootForRequest(body.pi_cwd);
+  const skillOptions = buildSkillOptionsFromSystemPrompt(systemPrompt, body.pi_cwd);
 
   const sessionId = derivePiSessionId(body);
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
@@ -767,6 +774,7 @@ async function handleChatCompletion(
     modelId, systemPrompt, effectiveUserText, turns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
     body.pi_cwd,
+    skillOptions,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -842,16 +850,65 @@ function stripTurnRuntimeState(turn: ParsedTurn & {
   return { userText: turn.userText, steps: turn.steps };
 }
 
+function unescapeXmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * Parses Pi's `<available_skills>` block (from formatSkillsForPrompt in pi-coding-agent)
+ * into Cursor protobuf skill descriptors so the agent service applies skills (not only raw prompt text).
+ */
+export function parseSkillDescriptorsFromSystemPrompt(systemPrompt: string, workspaceRoot: string | undefined): SkillDescriptor[] {
+  const root = resolveWorkspaceRootForRequest(workspaceRoot);
+  const block = /<available_skills>([\s\S]*?)<\/available_skills>/i.exec(systemPrompt);
+  if (!block) return [];
+  const inner = block[1] ?? "";
+  const result: SkillDescriptor[] = [];
+  const skillRe = /<skill\s*>([\s\S]*?)<\/skill>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = skillRe.exec(inner)) !== null) {
+    const chunk = m[1] ?? "";
+    const name = /<name>([\s\S]*?)<\/name>/i.exec(chunk)?.[1];
+    const description = /<description>([\s\S]*?)<\/description>/i.exec(chunk)?.[1] ?? "";
+    const location = /<location>([\s\S]*?)<\/location>/i.exec(chunk)?.[1];
+    if (!name?.trim() || !location?.trim()) continue;
+    const readmeFilePath = pathResolve(root, unescapeXmlEntities(location.trim()));
+    const folderPath = dirname(readmeFilePath);
+    result.push(create(SkillDescriptorSchema, {
+      name: unescapeXmlEntities(name.trim()),
+      description: unescapeXmlEntities(description.trim()),
+      folderPath,
+      enabled: true,
+      readmeFilePath,
+      packageType: PackageType.CLAUDE_SKILL,
+    }));
+  }
+  return result;
+}
+
+export function buildSkillOptionsFromSystemPrompt(systemPrompt: string, workspaceRoot: string | undefined): SkillOptions | undefined {
+  const skillDescriptors = parseSkillDescriptorsFromSystemPrompt(systemPrompt, workspaceRoot);
+  if (skillDescriptors.length === 0) return undefined;
+  return create(SkillOptionsSchema, { skillDescriptors });
+}
+
 export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const turns: ParsedTurn[] = [];
 
   debugLog("parse_messages.start", { messages });
 
-  const systemParts = messages.filter((m) => m.role === "system").map((m) => textContent(m.content));
+  const systemParts = messages
+    .filter((m) => m.role === "system" || m.role === "developer")
+    .map((m) => textContent(m.content));
   if (systemParts.length > 0) systemPrompt = systemParts.join("\n");
 
-  const nonSystem = messages.filter((m) => m.role !== "system");
+  const nonSystem = messages.filter((m) => m.role !== "system" && m.role !== "developer");
   let currentTurn: (ParsedTurn & {
     toolCallById: Map<string, ParsedToolCallStep>;
     sawToolResult: boolean;
@@ -1096,6 +1153,7 @@ export function buildCursorRequest(
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
   workspaceRoot?: string,
+  skillOptions?: SkillOptions,
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -1158,7 +1216,13 @@ export function buildCursorRequest(
     action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) },
   });
   const modelDetails = create(ModelDetailsSchema, { modelId, displayModelId: modelId, displayName: modelId });
-  const runRequest = create(AgentRunRequestSchema, { conversationState, action, modelDetails, conversationId });
+  const runRequest = create(AgentRunRequestSchema, {
+    conversationState,
+    action,
+    modelDetails,
+    conversationId,
+    ...(skillOptions && { skillOptions }),
+  });
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "runRequest", value: runRequest },
   });

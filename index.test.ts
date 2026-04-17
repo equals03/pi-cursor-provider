@@ -19,7 +19,9 @@ import {
   derivePiSessionId,
   deterministicConversationId,
   buildCursorRequest,
+  buildSkillOptionsFromSystemPrompt,
   parseMessages,
+  parseSkillDescriptorsFromSystemPrompt,
   setBridgeFactoryForTests,
 
   startProxy,
@@ -841,6 +843,41 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     expect(req.conversationState.turns).toHaveLength(0);
     const userAction = req.action.action.value as any;
     expect(userAction.userMessage.text).toBe("start over");
+  });
+});
+
+// ── Skills / developer role ──
+
+describe("skills and developer role — proxy", () => {
+  test("merges developer messages into system prompt (OpenAI-style)", () => {
+    const parsed = parseMessages([
+      { role: "developer", content: "Dev rules" },
+      { role: "system", content: "Sys rules" },
+      { role: "user", content: "hi" },
+    ]);
+    expect(parsed.systemPrompt).toBe("Dev rules\nSys rules");
+    expect(parsed.userText).toBe("hi");
+  });
+
+  test("parses Pi available_skills XML into protobuf descriptors", () => {
+    const cwd = "/tmp/pi-skill-test";
+    const prompt = `base\n<available_skills>\n  <skill>\n    <name>my-skill</name>\n    <description>Does the thing</description>\n    <location>.pi/skills/my-skill/SKILL.md</location>\n  </skill>\n</available_skills>`;
+    const d = parseSkillDescriptorsFromSystemPrompt(prompt, cwd);
+    expect(d).toHaveLength(1);
+    expect(d[0].name).toBe("my-skill");
+    expect(d[0].description).toBe("Does the thing");
+    expect(d[0].enabled).toBe(true);
+    expect(d[0].readmeFilePath).toMatch(/my-skill\/SKILL\.md$/);
+    expect(d[0].folderPath).toMatch(/\.pi\/skills\/my-skill$/);
+  });
+
+  test("buildCursorRequest forwards skillOptions on AgentRunRequest", () => {
+    const skillXml = `<available_skills>\n  <skill>\n    <name>x</name>\n    <description>d</description>\n    <location>/abs/SKILL.md</location>\n  </skill>\n</available_skills>`;
+    const skillOptions = buildSkillOptionsFromSystemPrompt(skillXml, "/tmp");
+    expect(skillOptions?.skillDescriptors).toHaveLength(1);
+    const payload = buildCursorRequest("gpt-5", "sys", "hi", [], "conv-1", null, undefined, "/tmp", skillOptions);
+    const req = decodeRunRequest(payload);
+    expect(req.skillOptions?.skillDescriptors?.[0]?.name).toBe("x");
   });
 });
 
