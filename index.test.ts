@@ -2,6 +2,9 @@ import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
+import { tmpdir } from "node:os";
+import { join as pathJoin, resolve as pathResolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
   resolveModelId,
@@ -490,6 +493,7 @@ describe("session cleanup", () => {
       mcpTools: [],
       pendingExecs: [],
       currentTurn: turn("current"),
+      workspaceRoot: process.cwd(),
     });
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv",
@@ -552,6 +556,7 @@ describe("session cleanup hook wiring", () => {
       mcpTools: [],
       pendingExecs: [],
       currentTurn: turn("current"),
+      workspaceRoot: process.cwd(),
     });
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv",
@@ -579,6 +584,7 @@ describe("session cleanup hook wiring", () => {
         mcpTools: [],
         pendingExecs: [],
         currentTurn: turn("current"),
+        workspaceRoot: process.cwd(),
       });
       __testInternals.conversationStates.set(convKey, {
         conversationId: "conv",
@@ -790,6 +796,13 @@ describe("buildCursorRequest — turn reconstruction", () => {
     const blobData = JSON.parse(new TextDecoder().decode(payload.blobStore.get(blobId)!));
     expect(blobData.role).toBe("system");
     expect(blobData.content).toBe("You are helpful");
+  });
+
+  test("previousWorkspaceUris uses workspaceRoot when provided", () => {
+    const customRoot = pathJoin(tmpdir(), `pi-ws-uri-test-${Date.now()}`);
+    const payload = buildCursorRequest("gpt-5", "system", "hi", [], "conv-1", null, undefined, customRoot);
+    const req = decodeRunRequest(payload);
+    expect(req.conversationState.previousWorkspaceUris).toEqual([pathToFileURL(pathResolve(customRoot)).href]);
   });
 
   test("each reconstructed turn has a unique messageId", () => {
@@ -1240,6 +1253,7 @@ describe("proxy integration — session handling", () => {
         assistantStep("continuing review"),
         toolStep("tc2", "read", { path: "README.md" }),
       ]),
+      workspaceRoot: process.cwd(),
     });
 
     const port = await startProxy(async () => "test-token");

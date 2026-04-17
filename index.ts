@@ -131,6 +131,7 @@ function summarizeProviderPayload(payload: unknown): unknown {
     model: typed.model,
     stream: typed.stream,
     pi_session_id: typed.pi_session_id,
+    pi_cwd: typed.pi_cwd,
     messageCount: Array.isArray(typed.messages) ? typed.messages.length : undefined,
     messages,
     toolCount: Array.isArray(typed.tools) ? typed.tools.length : undefined,
@@ -475,6 +476,7 @@ export default async function (pi: ExtensionAPI) {
     const payload = event.payload as Record<string, unknown> | undefined;
     if (payload && ctx.model?.provider === "cursor") {
       payload.pi_session_id = ctx.sessionManager.getSessionId();
+      payload.pi_cwd = ctx.cwd;
       debugExtensionLog("before_provider_request", {
         sessionId: ctx.sessionManager.getSessionId(),
         leafId: ctx.sessionManager.getLeafId?.(),

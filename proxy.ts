@@ -7,12 +7,12 @@
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { release as osRelease, tmpdir, type as osType } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -67,6 +67,8 @@ import {
   WriteShellStdinResultSchema,
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
+  GitRepoInfoSchema,
+  RequestContextEnvSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
@@ -120,12 +122,66 @@ interface ChatCompletionRequest {
   reasoning_effort?: string;
   user?: string;
   pi_session_id?: string;
+  /** Absolute working directory from the pi agent session (ExtensionContext.cwd). */
+  pi_cwd?: string;
 }
 
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+}
+
+/** Maps a filesystem path to a `file:` URI for Cursor's `previousWorkspaceUris`. */
+function workspaceFileUriFromRoot(root: string | undefined): string {
+  const trimmed = root?.trim();
+  const absolute = trimmed ? pathResolve(trimmed) : process.cwd();
+  return pathToFileURL(absolute).href;
+}
+
+/** Absolute workspace root for the Pi session (`pi_cwd`), or `process.cwd()` when unset. */
+export function resolveWorkspaceRootForRequest(raw: string | undefined): string {
+  const trimmed = raw?.trim();
+  return trimmed ? pathResolve(trimmed) : pathResolve(process.cwd());
+}
+
+function gitStdout(cwd: string, args: string[]): string | undefined {
+  try {
+    return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function collectGitReposForWorkspace(root: string) {
+  const top = gitStdout(root, ["rev-parse", "--show-toplevel"]);
+  if (!top) return [];
+  const branch = gitStdout(top, ["branch", "--show-current"])
+    || gitStdout(top, ["rev-parse", "--short", "HEAD"])
+    || "";
+  const status = gitStdout(top, ["status", "--porcelain"]) ?? "";
+  const remoteUrl = gitStdout(top, ["remote", "get-url", "origin"]);
+  return [create(GitRepoInfoSchema, {
+    path: top,
+    status,
+    branchName: branch,
+    ...(remoteUrl ? { remoteUrl } : {}),
+  })];
+}
+
+function buildMinimalRequestContextEnv(root: string) {
+  return create(RequestContextEnvSchema, {
+    osVersion: `${osType()} ${osRelease()}`,
+    workspacePaths: [root],
+    shell: process.env.SHELL || process.env.COMSPEC || "/bin/sh",
+    sandboxEnabled: false,
+    terminalsFolder: "",
+    agentSharedNotesFolder: "",
+    agentConversationNotesFolder: "",
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    projectFolder: "",
+    agentTranscriptsFolder: "",
+  });
 }
 
 interface PendingExec {
@@ -154,6 +210,8 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
   currentTurn: ParsedTurn;
+  /** Resolved Pi session directory (absolute path). */
+  workspaceRoot: string;
 }
 
 export interface StoredConversation {
@@ -658,6 +716,8 @@ async function handleChatCompletion(
     return;
   }
 
+  const workspaceRoot = resolveWorkspaceRootForRequest(body.pi_cwd);
+
   const sessionId = derivePiSessionId(body);
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
@@ -713,6 +773,7 @@ async function handleChatCompletion(
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
+    body.pi_cwd,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -731,10 +792,10 @@ async function handleChatCompletion(
 
   if (body.stream === false) {
     debugLog("chat.dispatch_nonstream", { requestId, convKey });
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res, requestId);
+    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res, workspaceRoot, requestId);
   } else {
     debugLog("chat.dispatch_stream", { requestId, bridgeKey, convKey });
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, requestId);
+    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, workspaceRoot, requestId);
   }
 }
 
@@ -1041,6 +1102,7 @@ export function buildCursorRequest(
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
+  workspaceRoot?: string,
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -1085,7 +1147,7 @@ export function buildCursorRequest(
       turns: turnBlobIds,
       todos: [],
       pendingToolCalls: [],
-      previousWorkspaceUris: [`file://${process.cwd()}`],
+      previousWorkspaceUris: [workspaceFileUriFromRoot(workspaceRoot)],
       mode: 1,
       fileStates: {},
       fileStatesV2: {},
@@ -1123,7 +1185,8 @@ function processServerMessage(
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
-  onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onCheckpoint: ((checkpointBytes: Uint8Array) => void) | undefined,
+  workspaceRoot: string,
 ): void {
   const msgCase = msg.message.case;
   debugLog("server_message", { msgCase, msg });
@@ -1143,7 +1206,7 @@ function processServerMessage(
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
-    handleExecMessage(msg.message.value as ExecServerMessage, mcpTools, sendFrame, onMcpExec);
+    handleExecMessage(msg.message.value as ExecServerMessage, mcpTools, sendFrame, onMcpExec, workspaceRoot);
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if ((stateStructure as any).tokenDetails) {
@@ -1194,14 +1257,22 @@ function handleExecMessage(
   mcpTools: McpToolDefinition[],
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
+  workspaceRoot: string,
 ): void {
   const execCase = (execMsg as any).message.case;
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "requestContextArgs") {
     const requestContext = create(RequestContextSchema, {
-      rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [],
-      projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [],
+      rules: [],
+      repositoryInfo: [],
+      tools: mcpTools,
+      gitRepos: collectGitReposForWorkspace(workspaceRoot),
+      projectLayouts: [],
+      mcpInstructions: [],
+      fileContents: {},
+      customSubagents: [],
+      env: buildMinimalRequestContextEnv(workspaceRoot),
     });
     const result = create(RequestContextResultSchema, {
       result: { case: "success", value: create(RequestContextSuccessSchema, { requestContext }) },
@@ -1562,6 +1633,7 @@ function handleStreamingResponse(
   currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
+  workspaceRoot: string,
   requestId: string,
 ): void {
   debugLog("stream.start", { requestId, bridgeKey, convKey, modelId });
@@ -1578,6 +1650,7 @@ function handleStreamingResponse(
     currentTurn,
     req,
     res,
+    workspaceRoot,
     requestId,
   );
 }
@@ -1621,6 +1694,7 @@ function writeSSEStream(
   currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
+  workspaceRoot: string,
   requestId?: string,
 ): void {
   debugLog("stream.writer_start", { requestId, bridgeKey, convKey, modelId, completedTurnCount: completedTurns.length, currentTurn });
@@ -1726,7 +1800,7 @@ function writeSSEStream(
             }));
 
             activeBridges.set(bridgeKey, {
-              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
+              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn, workspaceRoot,
             });
             debugLog("stream.tool_call_pause", { requestId, bridgeKey, exec, pendingExecs: state.pendingExecs, currentTurn });
 
@@ -1745,6 +1819,7 @@ function writeSSEStream(
             }
             debugLog("stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
           },
+          workspaceRoot,
         );
       } catch (err) {
         console.error("[cursor-provider] Stream message processing error:", err instanceof Error ? err.message : err);
@@ -1813,6 +1888,8 @@ export function writeSSEStreamForTests(args: {
   currentTurn: ParsedTurn;
   req: IncomingMessage;
   res: ServerResponse;
+  /** Defaults to {@link resolveWorkspaceRootForRequest}(undefined). */
+  workspaceRoot?: string;
   requestId?: string;
 }): void {
   writeSSEStream(
@@ -1827,6 +1904,7 @@ export function writeSSEStreamForTests(args: {
     args.currentTurn,
     args.req,
     args.res,
+    args.workspaceRoot ?? resolveWorkspaceRootForRequest(undefined),
     args.requestId,
   );
 }
@@ -1845,7 +1923,7 @@ function handleToolResultResume(
   stream: boolean,
   requestId?: string,
 ): void {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
+  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn, workspaceRoot } = active;
   debugLog("tool_resume.start", { requestId, bridgeKey, convKey, toolResults, pendingExecs, currentTurn });
 
   for (const result of toolResults) {
@@ -1865,6 +1943,7 @@ function handleToolResultResume(
       mcpTools,
       pendingExecs,
       currentTurn,
+      workspaceRoot,
     });
     debugLog("tool_resume.partial_wait", { requestId, bridgeKey, unresolvedExecs, currentTurn });
     respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res);
@@ -1915,6 +1994,7 @@ function handleToolResultResume(
     currentTurn,
     req,
     res,
+    workspaceRoot,
     requestId,
   );
 }
@@ -1930,6 +2010,7 @@ async function handleNonStreamingResponse(
   currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
+  workspaceRoot: string,
   requestId?: string,
 ): Promise<void> {
   debugLog("nonstream.start", { requestId, convKey, modelId, currentTurn, completedTurnCount: completedTurns.length });
@@ -1984,6 +2065,7 @@ async function handleNonStreamingResponse(
               }
               debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
             },
+            workspaceRoot,
           );
         } catch (err) {
           console.error("[cursor-provider] Non-stream message processing error:", err instanceof Error ? err.message : err);
