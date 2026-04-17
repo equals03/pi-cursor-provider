@@ -147,7 +147,13 @@ export function resolveWorkspaceRootForRequest(raw: string | undefined): string 
 
 function gitStdout(cwd: string, args: string[]): string | undefined {
   try {
-    return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }).trim();
+    // Suppress stderr: git prints fatal/error lines (e.g. missing remote) even when we only need exit status.
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
   } catch {
     return undefined;
   }
