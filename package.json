@@ -33,6 +33,7 @@
     "index.ts",
     "auth.ts",
     "proxy.ts",
+    "native-tools.ts",
     "h2-bridge.mjs",
     "cursor-models-raw.json",
     "proto/agent_pb.ts",

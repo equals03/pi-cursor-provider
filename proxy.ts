@@ -13,6 +13,7 @@ import { appendFileSync } from "node:fs";
 import { release as osRelease, tmpdir, type as osType } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { redirectNativeExecToTool, sendPendingExecResult, type PendingExec } from "./native-tools.js";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
@@ -182,14 +183,6 @@ function buildMinimalRequestContextEnv(root: string) {
     projectFolder: "",
     agentTranscriptsFolder: "",
   });
-}
-
-interface PendingExec {
-  execId: string;
-  execMsgId: number;
-  toolCallId: string;
-  toolName: string;
-  decodedArgs: string;
 }
 
 interface BridgeHandle {
@@ -1294,7 +1287,13 @@ function handleExecMessage(
     return;
   }
 
-  // Reject native Cursor tools so model falls back to MCP tools
+  const nativeRedirect = redirectNativeExecToTool(execMsg as ExecServerMessage, mcpTools);
+  if (nativeRedirect) {
+    onMcpExec(nativeRedirect);
+    return;
+  }
+
+  // Reject native Cursor tools when no Pi MCP mapping exists (same copy as before mapping).
   if (execCase === "readArgs") {
     const args = (execMsg as any).message.value;
     sendExecResult(execMsg, "readResult", create(ReadResultSchema, {
@@ -1953,29 +1952,7 @@ function handleToolResultResume(
   for (const exec of pendingExecs) {
     const result = turnResults.get(exec.toolCallId);
     if (!result) continue;
-    const mcpResult = create(McpResultSchema, {
-      result: {
-        case: "success",
-        value: create(McpSuccessSchema, {
-          content: [
-            create(McpToolResultContentItemSchema, {
-              content: { case: "text", value: create(McpTextContentSchema, { text: result.content }) },
-            }),
-          ],
-          isError: false,
-        }),
-      },
-    });
-
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: { case: "mcpResult" as any, value: mcpResult as any },
-    });
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+    sendPendingExecResult({ write: (data) => bridge.write(data) }, exec, result.content);
     debugLog("tool_resume.sent_result", { requestId, exec, result });
   }
 

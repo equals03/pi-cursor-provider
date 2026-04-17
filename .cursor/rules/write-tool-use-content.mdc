@@ -1,0 +1,18 @@
+---
+description: File write tools expect content (singular), not contents
+globs:
+alwaysApply: true
+---
+
+# Write tools — use `content`, not `contents`
+
+When calling a file **write** tool whose schema requires a body field for the full file text:
+
+- Use the parameter name **`content`** (singular).
+- Do **not** use **`contents`**. That commonly triggers validation errors such as: `must have required property 'content'`.
+
+This applies to the Cursor **Write** tool and to Pi **`mcp_pi_write`** when that schema uses `content`.
+
+Before calling any tool, match the **exact** parameter names from the tool definition you have in context; if writing fails, check for a `content` vs `contents` mismatch first.
+
+For partial edits, prefer **`StrReplace`**: `path`, `old_string`, and `new_string`.
